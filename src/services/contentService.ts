@@ -71,6 +71,7 @@ export const mapDBRowToContentScript = (row: any): ContentScript => {
     tone: parsedContent.tone || 'Review chân thực',
     createdAt: row.created_at || 'Mới tạo',
     estimatedViews: parsedContent.estimatedViews || '50k - 100k',
+    unverifiedClaimsNotes: parsedContent.unverifiedClaimsNotes || '',
     isDemo: false
   };
 };
@@ -102,7 +103,8 @@ export const mapContentScriptToDBRow = (script: Partial<ContentScript>): Record<
     voiceoverLines: script.voiceoverLines || [],
     callToAction: script.callToAction || '',
     tone: script.tone || 'Review chân thực',
-    estimatedViews: script.estimatedViews || '50k - 100k'
+    estimatedViews: script.estimatedViews || '50k - 100k',
+    unverifiedClaimsNotes: script.unverifiedClaimsNotes || ''
   };
   row.script = JSON.stringify(scriptContent);
 
@@ -189,7 +191,8 @@ export const contentService = {
         updates.hookVariantB !== undefined ||
         updates.activeHook !== undefined ||
         updates.voiceoverLines !== undefined ||
-        updates.callToAction !== undefined
+        updates.callToAction !== undefined ||
+        updates.unverifiedClaimsNotes !== undefined
       ) {
         dbUpdates.script = JSON.stringify({
           productName: updates.productName || '',
@@ -202,7 +205,8 @@ export const contentService = {
           voiceoverLines: updates.voiceoverLines || [],
           callToAction: updates.callToAction || '',
           tone: updates.tone || 'Review chân thực',
-          estimatedViews: updates.estimatedViews || '50k - 100k'
+          estimatedViews: updates.estimatedViews || '50k - 100k',
+          unverifiedClaimsNotes: updates.unverifiedClaimsNotes || ''
         });
       }
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AuthUser, ContentScript, ProductItem, ScriptStatus, SystemLog } from '../../types';
 import {
   Clapperboard,
@@ -12,13 +12,16 @@ import {
   Hash,
   AlertCircle,
   LogIn,
-  Check,
-  Edit3,
   Save,
   Plus,
   Trash2,
-  ExternalLink,
-  Cpu
+  Cpu,
+  RefreshCw,
+  ShoppingBag,
+  Percent,
+  Tag,
+  ShieldAlert,
+  ArrowRight
 } from 'lucide-react';
 import { edgeFunctionService, AIScriptOutput } from '../../services/edgeFunctionService';
 import { aiLogService } from '../../services/aiLogService';
@@ -29,6 +32,7 @@ interface ContentFactoryModuleProps {
   selectedProductForScript: ProductItem | null;
   currentUser?: AuthUser | null;
   onOpenAuthModal?: () => void;
+  onNavigateToProductHunter?: () => void;
   addToast?: (text: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
   addSystemLog?: (level: SystemLog['level'], source: SystemLog['source'], message: string) => Promise<{ error: string | null }>;
   onClearSelectedProduct: () => void;
@@ -36,7 +40,7 @@ interface ContentFactoryModuleProps {
   onToggleHookVariant: (scriptId: string) => void;
   onCopyText: (text: string, label: string) => void;
   onDownloadTxt: (script: ContentScript) => void;
-  onCreateScript: (newScript: ContentScript) => void;
+  onCreateScript: (newScript: ContentScript) => Promise<void> | void;
 }
 
 export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
@@ -45,8 +49,8 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
   selectedProductForScript,
   currentUser,
   onOpenAuthModal,
+  onNavigateToProductHunter,
   addToast,
-  addSystemLog,
   onClearSelectedProduct,
   onApproveScript,
   onToggleHookVariant,
@@ -69,25 +73,44 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
   const [targetProductId, setTargetProductId] = useState<string>(
     selectedProductForScript ? selectedProductForScript.id : products[0]?.id || ''
   );
+  const [targetAudience, setTargetAudience] = useState<string>(
+    'Khách hàng trẻ 18-35 tuổi, thích săn deal online, dân văn phòng & sinh viên'
+  );
   const [selectedTone, setSelectedTone] = useState<ContentScript['tone']>('Review chân thực');
   const [targetDuration, setTargetDuration] = useState<string>('35s - 45s');
   const [keyFeatures, setKeyFeatures] = useState<string>('');
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
   const [generationError, setGenerationError] = useState<{ message: string; hint?: string; details?: string } | null>(null);
+
+  // Sync selectedProductForScript when incoming prop changes
+  useEffect(() => {
+    if (selectedProductForScript) {
+      setTargetProductId(selectedProductForScript.id);
+      setIsGenerateModalOpen(true);
+      setGenerationError(null);
+    } else if (products.length > 0 && !targetProductId) {
+      setTargetProductId(products[0].id);
+    }
+  }, [selectedProductForScript, products, targetProductId]);
 
   const filteredScripts = scripts.filter((s) => {
     if (statusFilter !== 'all' && s.status !== statusFilter) return false;
     return true;
   });
 
+  // Find currently selected product in the form
+  const currentSelectedProduct = products.find((p) => p.id === targetProductId) || products[0];
+
   // Handle Generate with Supabase Edge Function & Gemini
   const handleGenerateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isGenerating) return; // Prevent duplicate clicks
+
     setGenerationError(null);
 
-    const product = products.find((p) => p.id === targetProductId) || products[0];
-    if (!product) {
-      if (addToast) addToast('Vui lòng chọn hoặc thêm một sản phẩm trước khi tạo kịch bản.', 'warning');
+    if (products.length === 0 || !currentSelectedProduct) {
+      if (addToast) addToast('Vui lòng thêm sản phẩm bên Product Hunter trước khi tạo kịch bản.', 'warning');
       return;
     }
 
@@ -104,28 +127,53 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
 
     try {
       const res = await edgeFunctionService.generateScript({
-        productName: product.name,
-        category: product.category,
-        platform: product.platform,
-        priceVND: product.priceVND,
+        productName: currentSelectedProduct.name,
+        category: currentSelectedProduct.category,
+        platform: currentSelectedProduct.platform,
+        priceVND: currentSelectedProduct.priceVND,
+        commissionRate: currentSelectedProduct.commissionRate,
+        targetAudience: targetAudience.trim() || undefined,
         tone: selectedTone,
         targetDuration,
         keyFeatures: keyFeatures.trim() || undefined
       });
 
       if (!res.success || !res.data) {
-        const errorMsg = res.error || 'Không thể tạo kịch bản từ Gemini';
+        // Classify error exactly per specification
+        let hint = res.hint;
+        const isOverloaded =
+          res.code === 'SERVICE_UNAVAILABLE' ||
+          res.error?.includes('503') ||
+          res.error?.includes('quá tải') ||
+          res.error?.includes('high demand');
+
+        if (isOverloaded) {
+          hint = 'Máy chủ AI của Google đang có lượng truy cập đột biến tạm thời (Spikes in demand). Hãy thử lại sau ít phút.';
+        } else if (res.code === 'TIMEOUT' || res.code === '504') {
+          hint = 'Hết thời gian chờ phản hồi từ máy chủ AI. Vui lòng bấm thử lại.';
+        } else if (res.code === 'RATE_LIMIT_EXCEEDED' || res.code === '429') {
+          hint = 'Hạn mức Gemini API đã chạm giới hạn (429 Rate Limit). Thử lại sau ít phút hoặc nâng hạn mức quota.';
+        } else if (res.code === 'FUNCTION_NOT_FOUND') {
+          hint = 'Edge Function chưa được deploy trên Supabase. Bạn có thể deploy qua Supabase Dashboard/CLI hoặc dùng mẫu kịch bản offline.';
+        } else if (res.code === 'UNAUTHORIZED' || res.code === '401') {
+          hint = 'Phiên đăng nhập đã hết hạn. Vui lòng nhấn "Đăng Nhập Quản Trị" để đăng nhập lại.';
+        } else if (res.code === 'API_KEY_INVALID' || res.code === 'MISSING_GEMINI_KEY') {
+          hint = 'Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets.';
+        } else if (!hint) {
+          hint = 'Vui lòng kiểm tra kết nối mạng và thử lại.';
+        }
+
+        const errorMsg = isOverloaded
+          ? 'Gemini hiện đang quá tải. Vui lòng thử lại sau ít phút.'
+          : (res.error || 'Không thể tạo kịch bản từ Gemini');
+
         setGenerationError({
           message: errorMsg,
           details: res.details,
-          hint: res.code === 'FUNCTION_NOT_FOUND' 
-            ? 'Edge function chưa được deploy trên Supabase. Bạn có thể deploy qua Supabase CLI hoặc tạo bằng mẫu kịch bản offline.'
-            : res.code === 'RATE_LIMIT_EXCEEDED'
-            ? 'Hạn mức Gemini API đã chạm giới hạn (429). Thử lại sau ít phút.'
-            : 'Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets.'
+          hint: hint
         });
 
-        // Ghi log thất bại vào DB ai_task_logs
+        // Ghi log đúng MỘT LẦN vào bảng ai_task_logs khi kết thúc thất bại
         await aiLogService.logAITask({
           level: 'error',
           source: 'Copywriter AI',
@@ -139,17 +187,27 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
       // Successful AI generation
       const aiOutput: AIScriptOutput = res.data;
 
+      // Không lưu bản nháp rỗng nếu thiếu tiêu đề hoặc nội dung
+      if (!aiOutput.title && !aiOutput.bodyStory) {
+        setGenerationError({
+          message: 'Dữ liệu trả về từ Gemini không đầy đủ.',
+          hint: 'Vui lòng thử tạo lại kịch bản.'
+        });
+        setIsGenerating(false);
+        return;
+      }
+
       const stagedScript: ContentScript = {
         id: 'script-' + Date.now(),
-        productId: product.id,
-        productName: product.name,
-        platform: product.platform,
-        title: aiOutput.title || `Kịch bản Shortform: ${product.name.slice(0, 35)}...`,
+        productId: currentSelectedProduct.id,
+        productName: currentSelectedProduct.name,
+        platform: currentSelectedProduct.platform,
+        title: aiOutput.title || `Kịch bản Shortform: ${currentSelectedProduct.name.slice(0, 35)}...`,
         targetDuration: aiOutput.targetDuration || targetDuration,
-        hookVariantA: aiOutput.hookVariantA || `Đừng bỏ qua ${product.name} nếu bạn đang tìm kiếm giải pháp tối ưu!`,
-        hookVariantB: aiOutput.hookVariantB || `Bí mật về ${product.name} ít người tiết lộ trước ngày siêu sale...`,
+        hookVariantA: aiOutput.hookVariantA || `Đừng bỏ qua ${currentSelectedProduct.name} nếu bạn đang tìm kiếm giải pháp tối ưu!`,
+        hookVariantB: aiOutput.hookVariantB || `Bí mật về ${currentSelectedProduct.name} ít người tiết lộ trước ngày siêu sale...`,
         activeHook: aiOutput.activeHook || 'A',
-        bodyStory: aiOutput.bodyStory || `Trải nghiệm thực tế sử dụng ${product.name} trong 7 ngày.`,
+        bodyStory: aiOutput.bodyStory || `Trải nghiệm thực tế sử dụng ${currentSelectedProduct.name} trong 7 ngày.`,
         voiceoverLines: Array.isArray(aiOutput.voiceoverLines) && aiOutput.voiceoverLines.length > 0
           ? aiOutput.voiceoverLines
           : [
@@ -160,7 +218,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
               },
               {
                 timestamp: '00:05 - 00:25',
-                speech: `Đây là ${product.name}, tính năng vượt trội trong tầm giá.`,
+                speech: `Đây là ${currentSelectedProduct.name}, tính năng vượt trội trong tầm giá.`,
                 action: 'Quay cận cảnh chi tiết và test thực tế'
               },
               {
@@ -172,14 +230,15 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
         callToAction: aiOutput.callToAction || 'Bấm ngay giỏ hàng góc trái màn hình để săn voucher giảm giá và freeship!',
         hashtags: Array.isArray(aiOutput.hashtags) && aiOutput.hashtags.length > 0
           ? aiOutput.hashtags
-          : [`#${product.platform === 'tiktok' ? 'tiktokshopvietnam' : 'shopeehaul'}`, '#reviewchansinh', '#dealhot'],
+          : [`#${currentSelectedProduct.platform === 'tiktok' ? 'tiktokshopvietnam' : 'shopeehaul'}`, '#reviewchansinh', '#dealhot'],
         status: 'draft',
         tone: selectedTone,
         createdAt: 'Vừa sinh bởi Gemini Flash (Supabase Edge Function)',
-        estimatedViews: aiOutput.estimatedViews || '60k - 150k'
+        estimatedViews: aiOutput.estimatedViews || '60k - 150k',
+        unverifiedClaimsNotes: aiOutput.unverifiedClaimsNotes || 'Lưu ý tuân thủ: Tránh khẳng định tuyệt đối về hiệu quả hoặc cam kết chữa dứt điểm theo chính sách TikTok Shop.'
       };
 
-      // Ghi log thành công vào DB ai_task_logs
+      // Ghi log duy nhất MỘT LẦN vào bảng ai_task_logs khi thành công
       await aiLogService.logAITask({
         level: 'info',
         source: 'Copywriter AI',
@@ -206,22 +265,21 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
     }
   };
 
-  // Fallback offline generator if edge function is not yet deployed
+  // Fallback offline generator if edge function is not yet deployed or user wants to test offline
   const handleUseOfflineFallback = () => {
-    const product = products.find((p) => p.id === targetProductId) || products[0];
-    if (!product) return;
+    if (!currentSelectedProduct) return;
 
     const offlineScript: ContentScript = {
       id: 'script-' + Date.now(),
-      productId: product.id,
-      productName: product.name,
-      platform: product.platform,
-      title: `Kịch bản Shortform Triệu View: ${product.name.slice(0, 35)}...`,
+      productId: currentSelectedProduct.id,
+      productName: currentSelectedProduct.name,
+      platform: currentSelectedProduct.platform,
+      title: `Kịch bản Shortform Triệu View: ${currentSelectedProduct.name.slice(0, 35)}...`,
       targetDuration,
-      hookVariantA: `Đừng lướt qua nếu bạn đang tìm kiếm giải pháp cho ${product.category.toLowerCase()} với giá hời!`,
-      hookVariantB: `Bí mật mà các shop bán ${product.category.toLowerCase()} không muốn bạn biết trước ngày sale...`,
+      hookVariantA: `Đừng lướt qua nếu bạn đang tìm kiếm giải pháp cho ${currentSelectedProduct.category.toLowerCase()} với giá hời!`,
+      hookVariantB: `Bí mật mà các shop bán ${currentSelectedProduct.category.toLowerCase()} không muốn bạn biết trước ngày sale...`,
       activeHook: 'A',
-      bodyStory: `Trải nghiệm thực tế sử dụng ${product.name}. Phân tích ưu điểm vượt trội so với các đối thủ cùng phân khúc giá ${product.priceVND.toLocaleString('vi-VN')} VNĐ.`,
+      bodyStory: `Trải nghiệm thực tế sử dụng ${currentSelectedProduct.name}. Phân tích ưu điểm vượt trội so với các đối thủ cùng phân khúc giá ${Number(currentSelectedProduct.priceVND).toLocaleString('vi-VN')} VNĐ.`,
       voiceoverLines: [
         {
           timestamp: '00:00 - 00:04',
@@ -230,7 +288,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
         },
         {
           timestamp: '00:05 - 00:18',
-          speech: `Đây là ${product.name}, trải nghiệm thực tế vượt xa kỳ vọng trong tầm giá!`,
+          speech: `Đây là ${currentSelectedProduct.name}, trải nghiệm thực tế vượt xa kỳ vọng trong tầm giá!`,
           action: 'Test tính năng chính, đưa ra kết quả đo lường cụ thể'
         },
         {
@@ -246,15 +304,15 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
       ],
       callToAction: 'Bấm ngay giỏ hàng góc trái màn hình để săn voucher giảm giá và freeship số lượng có hạn!',
       hashtags: [
-        `#${product.platform === 'tiktok' ? 'tiktokshopvietnam' : 'shopeehaul'}`,
+        `#${currentSelectedProduct.platform === 'tiktok' ? 'tiktokshopvietnam' : 'shopeehaul'}`,
         '#reviewchansinh',
-        '#goccongnghe',
         '#dealhot'
       ],
       status: 'draft',
       tone: selectedTone,
       createdAt: 'Bản nháp mẫu dự phòng',
-      estimatedViews: '50k - 120k'
+      estimatedViews: '50k - 120k',
+      unverifiedClaimsNotes: 'Lưu ý tuân thủ: Tránh các từ cấm như cam kết 100%, bảo hành trọn đời không căn cứ.'
     };
 
     setPreviewScript(offlineScript);
@@ -264,11 +322,24 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
   };
 
   // Confirm Save Script to Supabase content_drafts
-  const handleConfirmSaveToDrafts = () => {
-    if (!previewScript) return;
-    onCreateScript(previewScript);
-    setIsPreviewModalOpen(false);
-    setPreviewScript(null);
+  const handleConfirmSaveToDrafts = async () => {
+    if (!previewScript || isSaving) return;
+
+    if (!previewScript.title?.trim() || !previewScript.bodyStory?.trim()) {
+      if (addToast) addToast('Kịch bản không thể để trống tiêu đề hoặc nội dung câu chuyện.', 'warning');
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      await onCreateScript(previewScript);
+      setIsPreviewModalOpen(false);
+      setPreviewScript(null);
+    } catch (err: any) {
+      if (addToast) addToast(`Lỗi khi lưu kịch bản: ${err?.message || 'Không xác định'}`, 'error');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   // Scene Line helpers in Preview Modal
@@ -309,7 +380,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
           </h2>
           <p className="text-[11px] text-slate-400 flex items-center gap-1">
             <Cpu className="w-3 h-3 text-cyan-400" />
-            Backend: Supabase Edge Functions + Gemini 3.8 Flash
+            Backend: Supabase Edge Functions + Gemini 2.5 Flash
           </p>
         </div>
 
@@ -527,6 +598,14 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
                   </div>
                 </div>
 
+                {/* Unverified Claims & Compliance Note (if any) */}
+                {script.unverifiedClaimsNotes && (
+                  <div className="text-[10px] text-amber-300/90 bg-amber-950/25 p-2 rounded-lg border border-amber-900/50 flex items-start gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                    <span>{script.unverifiedClaimsNotes}</span>
+                  </div>
+                )}
+
                 {/* Actions: Approve / Copy / Download */}
                 <div className="flex items-center gap-2 pt-1 border-t border-slate-800">
                   {!isApproved && (
@@ -619,116 +698,197 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
               </div>
             )}
 
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="block text-slate-300 mb-1 font-medium">
-                  Chọn Sản Phẩm Cần Viết Kịch Bản *
-                </label>
-                <select
-                  value={targetProductId}
-                  onChange={(e) => setTargetProductId(e.target.value)}
-                  className="w-full p-2.5 rounded-lg bg-[#080D16] border border-slate-800 text-white focus:outline-none focus:border-cyan-500"
-                >
-                  {products.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      [{p.platform.toUpperCase()}] {p.name.slice(0, 45)}... ({Number(p.priceVND).toLocaleString('vi-VN')} đ · HH {p.commissionRate}%)
-                    </option>
-                  ))}
-                </select>
+            {/* Empty Products Alert */}
+            {products.length === 0 ? (
+              <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs space-y-2.5 text-center my-2">
+                <AlertCircle className="w-6 h-6 text-amber-400 mx-auto" />
+                <div className="space-y-1">
+                  <p className="font-bold text-white">Chưa Có Sản Phẩm Trong Kho</p>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    Content Factory cần dữ liệu sản phẩm từ bảng <code className="text-cyan-300">products</code> để sinh kịch bản đúng giá và ngành hàng. Hãy thêm sản phẩm tại Product Hunter trước khi tạo kịch bản!
+                  </p>
+                </div>
+                {onNavigateToProductHunter && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsGenerateModalOpen(false);
+                      onNavigateToProductHunter();
+                    }}
+                    className="mx-auto mt-1 px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-black font-bold text-xs flex items-center gap-1.5 transition-colors"
+                  >
+                    <span>Đến Product Hunter Ngay</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
+            ) : (
+              <div className="space-y-3 text-xs">
+                {/* Product Selection */}
+                <div>
+                  <label className="block text-slate-300 mb-1 font-medium">
+                    Chọn Sản Phẩm Cần Viết Kịch Bản *
+                  </label>
+                  <select
+                    value={targetProductId}
+                    onChange={(e) => setTargetProductId(e.target.value)}
+                    className="w-full p-2.5 rounded-lg bg-[#080D16] border border-slate-800 text-white focus:outline-none focus:border-cyan-500"
+                  >
+                    {products.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        [{p.platform.toUpperCase()}] {p.name.slice(0, 45)}... ({Number(p.priceVND).toLocaleString('vi-VN')} đ · HH {p.commissionRate}%)
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-              <div>
-                <label className="block text-slate-300 mb-1 font-medium">
-                  Đặc Điểm Nổi Bật / USP Của Sản Phẩm (Tùy chọn)
-                </label>
-                <input
-                  type="text"
-                  maxLength={300}
-                  placeholder="Ví dụ: Chống nước IPX7, pin trâu 48h, tặng kèm quà 100k..."
-                  value={keyFeatures}
-                  onChange={(e) => setKeyFeatures(e.target.value)}
-                  className="w-full p-2.5 rounded-lg bg-[#080D16] border border-slate-800 text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
-                />
-              </div>
+                {/* Selected Product Overview Card */}
+                {currentSelectedProduct && (
+                  <div className="p-3 rounded-xl bg-[#080D16] border border-cyan-500/30 space-y-2">
+                    <div className="flex items-center justify-between text-xs gap-2">
+                      <span className="font-bold text-white flex items-center gap-1.5 truncate">
+                        <ShoppingBag className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                        <span className="truncate">{currentSelectedProduct.name}</span>
+                      </span>
+                      <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-800 shrink-0">
+                        {currentSelectedProduct.platform}
+                      </span>
+                    </div>
 
-              <div>
-                <label className="block text-slate-300 mb-1 font-medium">
-                  Tone Giọng & Phong Cách Thể Hiện
-                </label>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {(
-                    [
-                      'Review chân thực',
-                      'Hài hước dí dỏm',
-                      'Kể chuyện Drama',
-                      'Chuyên gia phân tích'
-                    ] as const
-                  ).map((tone) => (
-                    <button
-                      key={tone}
-                      type="button"
-                      onClick={() => setSelectedTone(tone)}
-                      className={`p-2 rounded-lg text-left text-xs transition-colors border ${
-                        selectedTone === tone
-                          ? 'bg-purple-950 text-purple-200 border-purple-600 font-semibold'
-                          : 'bg-[#080D16] text-slate-400 border-slate-800 hover:text-slate-200'
-                      }`}
-                    >
-                      {tone}
-                    </button>
-                  ))}
+                    <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-slate-800/80">
+                      <div className="text-slate-400 flex items-center gap-1">
+                        <Tag className="w-3 h-3 text-purple-400" />
+                        <span>Ngành hàng:</span>
+                        <span className="text-slate-200 font-medium truncate">{currentSelectedProduct.category}</span>
+                      </div>
+                      <div className="text-slate-400 flex items-center gap-1">
+                        <Percent className="w-3 h-3 text-amber-400" />
+                        <span>Hoa hồng:</span>
+                        <span className="text-amber-400 font-bold font-mono">
+                          {currentSelectedProduct.commissionRate}%
+                        </span>
+                      </div>
+                      <div className="text-slate-400 col-span-2">
+                        Giá bán: <span className="text-emerald-400 font-bold font-mono">{Number(currentSelectedProduct.priceVND).toLocaleString('vi-VN')} đ</span>
+                        <span className="text-slate-500 ml-1.5">(Ước tính hoa hồng: ~{Number(currentSelectedProduct.estimatedCommissionVND).toLocaleString('vi-VN')} đ)</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Target Audience */}
+                <div>
+                  <label className="block text-slate-300 mb-1 font-medium">
+                    Đối Tượng Mục Tiêu (Target Audience)
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={200}
+                    placeholder="Ví dụ: Giới trẻ 18-35 tuổi, thích săn deal online, dân văn phòng..."
+                    value={targetAudience}
+                    onChange={(e) => setTargetAudience(e.target.value)}
+                    className="w-full p-2.5 rounded-lg bg-[#080D16] border border-slate-800 text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                  />
+                </div>
+
+                {/* Key Features */}
+                <div>
+                  <label className="block text-slate-300 mb-1 font-medium">
+                    Đặc Điểm Nổi Bật / USP Của Sản Phẩm (Tùy chọn)
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={300}
+                    placeholder="Ví dụ: Chống nước IPX7, pin trâu 48h, tặng kèm quà 100k..."
+                    value={keyFeatures}
+                    onChange={(e) => setKeyFeatures(e.target.value)}
+                    className="w-full p-2.5 rounded-lg bg-[#080D16] border border-slate-800 text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                  />
+                </div>
+
+                {/* Tone Selector */}
+                <div>
+                  <label className="block text-slate-300 mb-1 font-medium">
+                    Tone Giọng & Phong Cách Thể Hiện
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {(
+                      [
+                        'Review chân thực',
+                        'Hài hước dí dỏm',
+                        'Kể chuyện Drama',
+                        'Chuyên gia phân tích'
+                      ] as const
+                    ).map((tone) => (
+                      <button
+                        key={tone}
+                        type="button"
+                        onClick={() => setSelectedTone(tone)}
+                        className={`p-2 rounded-lg text-left text-xs transition-colors border ${
+                          selectedTone === tone
+                            ? 'bg-purple-950 text-purple-200 border-purple-600 font-semibold'
+                            : 'bg-[#080D16] text-slate-400 border-slate-800 hover:text-slate-200'
+                        }`}
+                      >
+                        {tone}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Target Duration */}
+                <div>
+                  <label className="block text-slate-300 mb-1 font-medium">
+                    Thời Lượng Video Dự Kiến
+                  </label>
+                  <select
+                    value={targetDuration}
+                    onChange={(e) => setTargetDuration(e.target.value)}
+                    className="w-full p-2.5 rounded-lg bg-[#080D16] border border-slate-800 text-white focus:outline-none focus:border-cyan-500"
+                  >
+                    <option value="20s - 30s">20s - 30s (Siêu ngắn, Hook cực mạnh)</option>
+                    <option value="35s - 45s">35s - 45s (Chuẩn TikTok Shop đề xuất)</option>
+                    <option value="50s - 65s">50s - 65s (Review chuyên sâu, kể chuyện)</option>
+                  </select>
+                </div>
+
+                <div className="p-2.5 rounded-xl bg-cyan-950/30 border border-cyan-800/40 text-[11px] text-cyan-300 space-y-1">
+                  <div className="font-semibold flex items-center gap-1.5 text-cyan-200">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Quy trình Gemini Edge Function:</span>
+                  </div>
+                  <p className="text-slate-300 leading-relaxed">
+                    1. Yêu cầu gửi qua Edge Function bảo mật bằng Supabase JWT.<br />
+                    2. Gemini tạo tiêu đề, 2 hook A/B, kịch bản phân cảnh và CTA giỏ hàng.<br />
+                    3. Backend tự động thử lại an toàn khi máy chủ AI quá tải (503/429).<br />
+                    4. Bạn sẽ được xem trước và chỉnh sửa toàn bộ kịch bản trước khi lưu vào bảng <code className="text-cyan-300 font-mono">content_drafts</code>.
+                  </p>
                 </div>
               </div>
-
-              <div>
-                <label className="block text-slate-300 mb-1 font-medium">
-                  Thời Lượng Video Dự Kiến
-                </label>
-                <select
-                  value={targetDuration}
-                  onChange={(e) => setTargetDuration(e.target.value)}
-                  className="w-full p-2.5 rounded-lg bg-[#080D16] border border-slate-800 text-white focus:outline-none focus:border-cyan-500"
-                >
-                  <option value="20s - 30s">20s - 30s (Siêu ngắn, Hook cực mạnh)</option>
-                  <option value="35s - 45s">35s - 45s (Chuẩn TikTok Shop đề xuất)</option>
-                  <option value="50s - 65s">50s - 65s (Review chuyên sâu, kể chuyện)</option>
-                </select>
-              </div>
-
-              <div className="p-2.5 rounded-xl bg-cyan-950/30 border border-cyan-800/40 text-[11px] text-cyan-300 space-y-1">
-                <div className="font-semibold flex items-center gap-1.5 text-cyan-200">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Quy trình Gemini Edge Function:</span>
-                </div>
-                <p className="text-slate-300">
-                  1. Yêu cầu gửi qua Edge Function bảo mật bằng Supabase JWT.<br />
-                  2. Gemini tạo tiêu đề, 2 hook A/B, kịch bản phân cảnh và CTA giỏ hàng.<br />
-                  3. Bạn sẽ được xem trước và chỉnh sửa toàn bộ kịch bản trước khi lưu vào bảng <code className="text-cyan-300 font-mono">content_drafts</code>.
-                </p>
-              </div>
-            </div>
+            )}
 
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
               <button
                 type="button"
+                disabled={isGenerating}
                 onClick={() => {
                   setIsGenerateModalOpen(false);
                   onClearSelectedProduct();
                   setGenerationError(null);
                 }}
-                className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium"
+                className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium disabled:opacity-40"
               >
                 Hủy
               </button>
               <button
                 type="submit"
-                disabled={isGenerating}
-                className="px-4 py-1.5 rounded-lg bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-400 hover:to-purple-500 text-black text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-cyan-500/20 disabled:opacity-50"
+                disabled={isGenerating || products.length === 0}
+                className="px-4 py-1.5 rounded-lg bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-400 hover:to-purple-500 text-black text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-cyan-500/20 disabled:opacity-50 transition-all cursor-pointer disabled:cursor-not-allowed"
               >
                 {isGenerating ? (
                   <>
-                    <span className="w-3.5 h-3.5 border-2 border-black border-t-transparent rounded-full animate-spin" />
-                    <span>Gemini đang viết...</span>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Gemini đang viết kịch bản...</span>
                   </>
                 ) : (
                   <>
@@ -756,7 +916,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
                   </h3>
                 </div>
                 <p className="text-[11px] text-slate-400 mt-0.5">
-                  Kiểm tra nội dung từ Gemini trước khi bấm lưu vào Supabase <code className="text-cyan-300">content_drafts</code>.
+                  Kiểm tra nội dung từ Gemini trước khi bấm lưu vào Supabase <code className="text-cyan-300 font-mono">content_drafts</code>.
                 </p>
               </div>
               <button
@@ -794,8 +954,8 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
                     <button
                       type="button"
                       onClick={() => setPreviewScript({ ...previewScript, activeHook: 'A' })}
-                      className={`px-2 py-0.5 rounded font-bold ${
-                        previewScript.activeHook === 'A' ? 'bg-cyan-500 text-black' : 'text-slate-400'
+                      className={`px-2 py-0.5 rounded font-bold transition-colors ${
+                        previewScript.activeHook === 'A' ? 'bg-cyan-500 text-black' : 'text-slate-400 hover:text-white'
                       }`}
                     >
                       Dùng Hook A
@@ -803,8 +963,8 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
                     <button
                       type="button"
                       onClick={() => setPreviewScript({ ...previewScript, activeHook: 'B' })}
-                      className={`px-2 py-0.5 rounded font-bold ${
-                        previewScript.activeHook === 'B' ? 'bg-cyan-500 text-black' : 'text-slate-400'
+                      className={`px-2 py-0.5 rounded font-bold transition-colors ${
+                        previewScript.activeHook === 'B' ? 'bg-cyan-500 text-black' : 'text-slate-400 hover:text-white'
                       }`}
                     >
                       Dùng Hook B
@@ -937,25 +1097,69 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
                   />
                 </div>
               </div>
+
+              {/* Unverified Claims & Policy Compliance Warning Box */}
+              <div className="p-3 rounded-xl bg-amber-950/35 border border-amber-800/50 space-y-2">
+                <div className="flex items-center justify-between text-xs font-semibold text-amber-300">
+                  <span className="flex items-center gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    Lưu Ý Tuân Thủ Chính Sách Quảng Cáo TikTok Shop Việt Nam
+                  </span>
+                  <span className="text-[10px] text-amber-400/80 font-normal">Chính sách Affiliate</span>
+                </div>
+                <textarea
+                  rows={2}
+                  value={previewScript.unverifiedClaimsNotes || ''}
+                  onChange={(e) => setPreviewScript({ ...previewScript, unverifiedClaimsNotes: e.target.value })}
+                  placeholder="Lưu ý tuân thủ: Không dùng các cam kết 100%, trị dứt điểm, hiệu quả vĩnh viễn..."
+                  className="w-full p-2 rounded bg-[#0D121D] border border-amber-800/50 text-amber-100 text-xs focus:outline-none focus:border-amber-500"
+                />
+                <p className="text-[10px] text-slate-400 leading-relaxed">
+                  Quy định kiểm duyệt: Không tự ý bịa đặt thông số kỹ thuật, bảo hành sai lệch hoặc cam kết sai sự thật so với công bố của nhãn hàng.
+                </p>
+              </div>
             </div>
 
             {/* Bottom Modal Actions */}
             <div className="flex items-center justify-between gap-2 pt-3 border-t border-slate-800">
-              <button
-                type="button"
-                onClick={() => setIsPreviewModalOpen(false)}
-                className="px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium"
-              >
-                Hủy bỏ
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsPreviewModalOpen(false)}
+                  className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium"
+                >
+                  Đóng
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsPreviewModalOpen(false);
+                    setIsGenerateModalOpen(true);
+                  }}
+                  className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 text-xs font-semibold flex items-center gap-1 transition-colors"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>Tạo Lại</span>
+                </button>
+              </div>
 
               <button
                 type="button"
+                disabled={isSaving}
                 onClick={handleConfirmSaveToDrafts}
-                className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 active:scale-95 transition-all"
+                className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 active:scale-95 transition-all disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
               >
-                <Save className="w-3.5 h-3.5 stroke-[2.5]" />
-                <span>Lưu Kịch Bản Vào Bản Nháp (Supabase)</span>
+                {isSaving ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Đang lưu Supabase...</span>
+                  </>
+                ) : (
+                  <>
+                    <Save className="w-3.5 h-3.5 stroke-[2.5]" />
+                    <span>Lưu Kịch Bản Vào Bản Nháp</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

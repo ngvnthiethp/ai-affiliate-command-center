@@ -17,6 +17,7 @@ export interface AIScriptOutput {
   targetDuration: string;
   tone: ContentScript['tone'];
   estimatedViews: string;
+  unverifiedClaimsNotes?: string;
 }
 
 export interface AIProductAnalysis {
@@ -52,15 +53,24 @@ export interface EdgeFunctionResult<T> {
   error?: string | null;
   code?: string;
   details?: string;
+  hint?: string;
+  attempts?: number;
+}
+
+export interface InvokeOptions {
+  signal?: AbortSignal;
 }
 
 export const edgeFunctionService = {
   /**
-   * Helper to invoke 'generate-content' edge function with JWT authentication
+   * Gọi Supabase Edge Function 'generate-content'
+   * Lưu ý: Cơ chế retry transient error (503, 502, 500, 429) với Exponential Backoff & Jitter
+   * được xử lý trực tiếp tại backend Edge Function để tránh lãng phí thời gian và xung đột timeout.
    */
   async invokeFunction<T>(
     action: 'generate_script' | 'analyze_product' | 'trend_ideas' | 'audit_content' | 'generate_title_description',
-    payload: Record<string, any>
+    payload: Record<string, any>,
+    options?: InvokeOptions
   ): Promise<EdgeFunctionResult<T>> {
     if (!isSupabaseConfigured()) {
       return {
@@ -81,26 +91,37 @@ export const edgeFunctionService = {
       };
     }
 
-    // Check user session
+    // 1. Kiểm tra phiên đăng nhập (JWT Authentication)
     const { data: sessionData } = await client.auth.getSession();
     if (!sessionData?.session) {
       return {
         success: false,
         data: null,
-        error: 'Yêu cầu đăng nhập: Bạn cần đăng nhập tài khoản trước khi thực thi tác vụ AI thông qua Edge Functions.',
+        error: 'Yêu cầu đăng nhập: Bạn cần đăng nhập tài khoản trước khi thực thi tác vụ AI qua Edge Functions.',
         code: 'UNAUTHORIZED'
       };
     }
 
+    // 2. Kiểm tra nếu người dùng đã hủy (AbortSignal)
+    if (options?.signal?.aborted) {
+      return {
+        success: false,
+        data: null,
+        error: 'Yêu cầu đã bị hủy.',
+        code: 'ABORTED'
+      };
+    }
+
     try {
+      // 3. Gửi request duy nhất tới Edge Function (Backend tự quản lý retry 3 lần)
       const { data, error } = await client.functions.invoke('generate-content', {
         body: { action, payload }
       });
 
+      // Xử lý khi có lỗi HTTP từ Edge Function
       if (error) {
         let errorBody: any = null;
         try {
-          // Supabase JS FunctionsHttpError provides context containing the Response object
           const anyErr = error as any;
           if (anyErr?.context && typeof anyErr.context.json === 'function') {
             errorBody = await anyErr.context.json();
@@ -108,95 +129,123 @@ export const edgeFunctionService = {
             errorBody = JSON.parse(anyErr.context.text);
           }
         } catch {
-          // Keep raw error
+          // Không parse được body
         }
 
-        if (errorBody && errorBody.error) {
-          return {
-            success: false,
-            data: null,
-            error: errorBody.error + (errorBody.hint ? `\n👉 Gợi ý: ${errorBody.hint}` : ''),
-            code: errorBody.code || 'FUNCTION_ERROR',
-            details: errorBody.details
-          };
+        const rawMsg = error.message || String(error);
+
+        // Phân loại mã lỗi chuẩn
+        let resolvedCode = errorBody?.code;
+        let resolvedError = errorBody?.error;
+        let resolvedHint = errorBody?.hint;
+        let resolvedDetails = errorBody?.details || rawMsg;
+
+        // 404: Function chưa deploy
+        if (rawMsg.includes('404') || rawMsg.includes('Failed to send a request') || rawMsg.includes('FunctionsFetchError')) {
+          resolvedCode = 'FUNCTION_NOT_FOUND';
+          resolvedError = 'Edge Function "generate-content" chưa được deploy trên Supabase hoặc URL không phản hồi.';
+          resolvedHint = 'Vui lòng triển khai function theo tài liệu EDGE_FUNCTION_DEPLOY_GUIDE.md.';
         }
-
-        const errMsg = error.message || String(error);
-
-        // Edge function not deployed yet
-        if (errMsg.includes('404') || errMsg.includes('Failed to send a request') || errMsg.includes('FunctionsFetchError')) {
-          return {
-            success: false,
-            data: null,
-            error: 'Edge Function "generate-content" chưa được deploy trên Supabase hoặc URL không phản hồi. Vui lòng deploy function trên Supabase Dashboard hoặc CLI.',
-            code: 'FUNCTION_NOT_FOUND',
-            details: errMsg
-          };
+        // 401: Unauthorized
+        else if (rawMsg.includes('401') || resolvedCode === 'UNAUTHORIZED') {
+          resolvedCode = 'UNAUTHORIZED';
+          resolvedError = resolvedError || 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Vui lòng đăng nhập lại.';
+          resolvedHint = 'Nhấn nút "Đăng Nhập Quản Trị" để đăng nhập lại tài khoản.';
         }
-
-        // 401 Unauthorized
-        if (errMsg.includes('401') || errMsg.includes('UNAUTHORIZED') || errMsg.includes('INVALID_SESSION')) {
-          return {
-            success: false,
-            data: null,
-            error: 'Phiên làm việc đã hết hạn hoặc token không hợp lệ. Vui lòng đăng nhập lại.',
-            code: 'UNAUTHORIZED',
-            details: errMsg
-          };
+        // 403: API Key Invalid
+        else if (rawMsg.includes('403') || resolvedCode === 'API_KEY_INVALID') {
+          resolvedCode = 'API_KEY_INVALID';
+          resolvedError = resolvedError || 'Khóa GEMINI_API_KEY hoặc quyền truy cập không hợp lệ.';
+          resolvedHint = 'Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets.';
         }
-
-        // Rate limit 429
-        if (errMsg.includes('429') || errMsg.includes('RATE_LIMIT_EXCEEDED')) {
-          return {
-            success: false,
-            data: null,
-            error: 'Hạn mức Gemini API đã chạm giới hạn (429 Quota Exceeded). Vui lòng thử lại sau ít phút hoặc nâng cấp quota.',
-            code: 'RATE_LIMIT_EXCEEDED',
-            details: errMsg
-          };
+        // 429: Rate Limit
+        else if (rawMsg.includes('429') || resolvedCode === 'RATE_LIMIT_EXCEEDED') {
+          resolvedCode = 'RATE_LIMIT_EXCEEDED';
+          resolvedError = 'Gemini API vượt hạn mức hoặc tốc độ yêu cầu (429 Rate Limit). Vui lòng thử lại sau ít phút hoặc nâng cấp quota.';
+          resolvedHint = 'Đợi 1-2 phút hoặc kiểm tra quota tại Google AI Studio.';
+        }
+        // 503: Service Unavailable (Quá tải) - TUYỆT ĐỐI KHÔNG HIỂN THỊ "Kiểm tra GEMINI_API_KEY"
+        else if (rawMsg.includes('503') || rawMsg.includes('high demand') || resolvedCode === 'SERVICE_UNAVAILABLE') {
+          resolvedCode = 'SERVICE_UNAVAILABLE';
+          resolvedError = 'Gemini hiện đang quá tải. Vui lòng thử lại sau ít phút.';
+          resolvedHint = 'Máy chủ AI của Google đang có lượng truy cập đột biến tạm thời (Spikes in demand). Hãy thử lại sau ít phút.';
+        }
+        // 504: Timeout
+        else if (rawMsg.includes('504') || resolvedCode === 'TIMEOUT') {
+          resolvedCode = 'TIMEOUT';
+          resolvedError = 'Hết thời gian chờ phản hồi từ máy chủ AI (504 Timeout). Vui lòng thử lại.';
+          resolvedHint = 'Kết nối mạng tới máy chủ AI quá hạn.';
+        }
+        // 500 / 502: Server Error
+        else if (rawMsg.includes('502') || rawMsg.includes('500') || resolvedCode === 'SERVER_ERROR' || resolvedCode === 'BAD_GATEWAY') {
+          resolvedCode = resolvedCode || 'SERVER_ERROR';
+          resolvedError = resolvedError || 'Lỗi máy chủ tạm thời từ Google Gemini (HTTP 500/502). Vui lòng thử lại sau ít phút.';
+          resolvedHint = 'Máy chủ AI đang gặp trục trặc tạm thời.';
         }
 
         return {
           success: false,
           data: null,
-          error: `Lỗi Edge Function: ${errMsg}`,
-          code: 'FUNCTION_ERROR',
-          details: errMsg
+          error: resolvedError || `Lỗi Edge Function: ${rawMsg}`,
+          code: resolvedCode || 'FUNCTION_ERROR',
+          details: resolvedDetails,
+          hint: resolvedHint,
+          attempts: 1
         };
       }
 
-      // If backend returned error payload in response body
-      if (data && !data.success && data.error) {
+      // Xử lý khi response trả về lỗi trong body (data.success === false)
+      if (data && !data.success) {
+        const resolvedCode = data.code || 'BACKEND_ERROR';
+        const resolvedError = data.error || 'Lỗi không xác định từ backend';
+        let resolvedHint = data.hint;
+
+        if (resolvedCode === 'SERVICE_UNAVAILABLE' || resolvedError.includes('503') || resolvedError.includes('quá tải')) {
+          resolvedHint = 'Máy chủ AI của Google đang có lượng truy cập cao đột biến. Hãy thử lại sau ít phút.';
+        } else if (resolvedCode === 'API_KEY_INVALID' || resolvedCode === 'MISSING_GEMINI_KEY') {
+          resolvedHint = 'Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets.';
+        }
+
         return {
           success: false,
           data: null,
-          error: data.error,
-          code: data.code || 'BACKEND_ERROR',
-          details: data.details
+          error: resolvedError,
+          code: resolvedCode,
+          details: data.details,
+          hint: resolvedHint,
+          attempts: data.attempts || 1
         };
       }
 
+      // Thành công: Trả về kết quả
       if (data && data.success && data.data) {
         return {
           success: true,
           data: data.data as T,
           model: data.model,
+          attempts: data.attempts || 1,
           error: null
         };
       }
 
+      // Response không đúng định dạng
       return {
         success: false,
         data: null,
-        error: 'Phản hồi từ Edge Function không đúng định dạng',
-        code: 'MALFORMED_RESPONSE'
+        error: 'Phản hồi từ Edge Function không đúng định dạng.',
+        code: 'MALFORMED_RESPONSE',
+        attempts: 1
       };
     } catch (err: any) {
+      // Lỗi ngoại lệ mạng (Network Exception)
+      const errMsg = err?.message || String(err);
       return {
         success: false,
         data: null,
-        error: `Không thể kết nối Edge Function: ${err?.message || err}`,
-        code: 'NETWORK_EXCEPTION'
+        error: `Không thể kết nối Edge Function: ${errMsg}`,
+        code: 'NETWORK_EXCEPTION',
+        details: errMsg,
+        attempts: 1
       };
     }
   },
@@ -204,57 +253,74 @@ export const edgeFunctionService = {
   /**
    * Content Factory: Generate TikTok / Shopee Affiliate Script
    */
-  async generateScript(params: {
-    productName: string;
-    category: string;
-    platform: 'tiktok' | 'shopee' | 'lazada';
-    priceVND: number;
-    tone: ContentScript['tone'];
-    targetDuration: string;
-    keyFeatures?: string;
-  }): Promise<EdgeFunctionResult<AIScriptOutput>> {
-    return this.invokeFunction<AIScriptOutput>('generate_script', params);
+  async generateScript(
+    params: {
+      productName: string;
+      category: string;
+      platform: 'tiktok' | 'shopee' | 'lazada';
+      priceVND: number;
+      commissionRate?: number;
+      targetAudience?: string;
+      tone: ContentScript['tone'];
+      targetDuration: string;
+      keyFeatures?: string;
+    },
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<AIScriptOutput>> {
+    return this.invokeFunction<AIScriptOutput>('generate_script', params, options);
   },
 
   /**
    * Scout AI: Analyze affiliate deal potential
    */
-  async analyzeProduct(params: {
-    productName: string;
-    category: string;
-    priceVND: number;
-    platform: string;
-  }): Promise<EdgeFunctionResult<AIProductAnalysis>> {
-    return this.invokeFunction<AIProductAnalysis>('analyze_product', params);
+  async analyzeProduct(
+    params: {
+      productName: string;
+      category: string;
+      priceVND: number;
+      platform: string;
+    },
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<AIProductAnalysis>> {
+    return this.invokeFunction<AIProductAnalysis>('analyze_product', params, options);
   },
 
   /**
    * Trend AI: Catch shortform affiliate trends
    */
-  async fetchTrendIdeas(params: {
-    category: string;
-    platform: string;
-  }): Promise<EdgeFunctionResult<AITrendIdea>> {
-    return this.invokeFunction<AITrendIdea>('trend_ideas', params);
+  async fetchTrendIdeas(
+    params: {
+      category: string;
+      platform: string;
+    },
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<AITrendIdea>> {
+    return this.invokeFunction<AITrendIdea>('trend_ideas', params, options);
   },
 
   /**
    * Auditor AI: Check TikTok Shop compliance & banned words
    */
-  async auditContent(params: {
-    title: string;
-    scriptText: string;
-  }): Promise<EdgeFunctionResult<AIAuditResult>> {
-    return this.invokeFunction<AIAuditResult>('audit_content', params);
+  async auditContent(
+    params: {
+      title: string;
+      scriptText: string;
+    },
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<AIAuditResult>> {
+    return this.invokeFunction<AIAuditResult>('audit_content', params, options);
   },
 
   /**
    * Title & Description Generator for TikTok Affiliate
    */
-  async generateTitleDescription(params: {
-    productName: string;
-    category: string;
-  }): Promise<EdgeFunctionResult<{ titles: string[]; description: string; hashtags: string[] }>> {
-    return this.invokeFunction<{ titles: string[]; description: string; hashtags: string[] }>('generate_title_description', params);
+  async generateTitleDescription(
+    params: {
+      productName: string;
+      category: string;
+    },
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<{ titles: string[]; description: string; hashtags: string[] }>> {
+    return this.invokeFunction<{ titles: string[]; description: string; hashtags: string[] }>('generate_title_description', params, options);
   }
 };

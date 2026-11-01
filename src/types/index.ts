@@ -100,6 +100,7 @@ export interface ContentScript {
   tone: 'Hài hước dí dỏm' | 'Review chân thực' | 'Kể chuyện Drama' | 'Chuyên gia phân tích';
   createdAt: string;
   estimatedViews: string;
+  unverifiedClaimsNotes?: string;
   isDemo?: boolean;
 }
 

@@ -138,6 +138,7 @@ export default function App() {
               selectedProductForScript={store.selectedProductForScript}
               currentUser={store.currentUser}
               onOpenAuthModal={() => store.setIsAuthModalOpen(true)}
+              onNavigateToProductHunter={() => store.setCurrentModule('product-hunter')}
               addToast={store.addToast}
               addSystemLog={store.addSystemLog}
               onClearSelectedProduct={() => store.setSelectedProductForScript(null)}
