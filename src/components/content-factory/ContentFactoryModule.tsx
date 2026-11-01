@@ -94,10 +94,17 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
     };
   }, []);
 
-  // Sync selectedProductForScript when incoming prop changes
+  // Sync selectedProductForScript when incoming prop changes from Product Hunter
   useEffect(() => {
     if (selectedProductForScript) {
       setTargetProductId(selectedProductForScript.id);
+      if (selectedProductForScript.aiAnalysis?.targetAudience) {
+        setTargetAudience(selectedProductForScript.aiAnalysis.targetAudience);
+      }
+      const usps = selectedProductForScript.usp || selectedProductForScript.aiAnalysis?.extractedUSPs?.join(', ');
+      if (usps) {
+        setKeyFeatures(usps);
+      }
       setIsGenerateModalOpen(true);
       setGenerationError(null);
     } else if (products.length > 0 && !targetProductId) {
@@ -218,13 +225,6 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
           message: errorMsg,
           details: res.details,
           hint: hint
-        });
-
-        // Ghi log đúng MỘT LẦN vào bảng ai_task_logs khi kết thúc thất bại thật
-        await aiLogService.logAITask({
-          level: 'error',
-          source: 'Copywriter AI',
-          message: `Thất bại khi gọi Gemini: ${res.code || 'ERROR'} - ${errorMsg.slice(0, 100)}`
         });
 
         setIsGenerating(false);

@@ -100,17 +100,87 @@ export interface CostQuotaStatus {
 
 export type PlatformType = 'tiktok' | 'shopee' | 'lazada';
 
+export type PipelineStatus = 
+  | 'DISCOVERED' 
+  | 'ANALYZING' 
+  | 'SHORTLISTED' 
+  | 'APPROVED' 
+  | 'CONTENT_CREATED' 
+  | 'PUBLISHED' 
+  | 'REJECTED';
+
+export interface ProductCompetitor {
+  id: string;
+  name: string;
+  url?: string;
+  priceVND: number;
+  commissionRate?: number;
+  notes?: string;
+  isDirect?: boolean;
+}
+
+export interface ScoreBreakdownCriterion {
+  score: number;
+  maxScore: number;
+  explanation: string;
+  reliability: 'HIGH' | 'MEDIUM' | 'LOW';
+}
+
+export interface ProductOpportunityScore {
+  totalScore: number; // 0 - 100
+  tier: 'HIGH OPPORTUNITY' | 'POTENTIAL' | 'NEEDS RESEARCH' | 'LOW PRIORITY';
+  breakdown: {
+    affiliateCommission: ScoreBreakdownCriterion; // Max 20
+    marketDemand: ScoreBreakdownCriterion;        // Max 20
+    tiktokContentPotential: ScoreBreakdownCriterion; // Max 20
+    competition: ScoreBreakdownCriterion;         // Max 15
+    priceConversion: ScoreBreakdownCriterion;     // Max 15
+    dataReliability: ScoreBreakdownCriterion;     // Max 10
+  };
+  disclaimer: string;
+  evaluatedAt: string;
+}
+
+export interface ProductAIAnalysis {
+  targetAudience: string;
+  solvedNeeds: string;
+  extractedUSPs: string[];
+  pros: string[];
+  cons: string[];
+  risks: string[];
+  contentAngles: string[];
+  commissionAnalysis: {
+    expectedCommissionVND: number;
+    discountPct?: number;
+    commissionRate: number;
+    marginNote: string;
+  };
+  marketAnalysis: {
+    demandLevel: string;
+    seasonality: string;
+    competitionLevel: string;
+    targetSegment: string;
+  };
+  rawResponse?: string;
+  modelUsed?: string;
+  providerUsed?: string;
+  analyzedAt?: string;
+  inferenceType: 'AI_INFERENCE' | 'VERIFIED_DATA';
+}
+
 export interface ProductItem {
   id: string;
   name: string;
   category: 'Công nghệ' | 'Làm đẹp & Chăm sóc' | 'Gia dụng thông minh' | 'Thời trang & Phụ kiện' | 'Ẩm thực';
   platform: PlatformType;
   priceVND: number;
+  originalPriceVND?: number;
   commissionRate: number; // e.g., 18%
   estimatedCommissionVND: number;
-  viralScore: number; // 0 - 100
+  viralScore: number; // 0 - 100 (Legacy alias for Opportunity Score)
   soldCount7D: number;
   rating: number;
+  reviewCount?: number;
   imageUrl: string;
   affiliateUrl: string;
   shortUrl: string;
@@ -119,6 +189,21 @@ export interface ProductItem {
   commissionStatus: 'stable' | 'increased' | 'decreased';
   isDemo?: boolean;
   createdAt?: string;
+
+  // Phase 4 Extensions
+  description?: string;
+  usp?: string;
+  sourceType?: 'manual' | 'csv' | 'url_import';
+  sourceUrl?: string;
+  dataSource?: string;
+  collectedAt?: string;
+  dataReliability?: number; // 0 - 100
+  opportunityScore?: ProductOpportunityScore;
+  aiAnalysis?: ProductAIAnalysis;
+  competitors?: ProductCompetitor[];
+  pipelineStatus?: PipelineStatus;
+  isFavorite?: boolean;
+  lastAnalyzedAt?: string;
 }
 
 export type ScriptStatus = 'draft' | 'pending' | 'approved' | 'published';

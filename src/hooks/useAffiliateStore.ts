@@ -435,6 +435,20 @@ export function useAffiliateStore() {
   }, [addToast, addSystemLog]);
 
   const deleteCustomProduct = useCallback(async (id: string) => {
+    // Phase 4 Guard: Không xóa sản phẩm đã liên kết với content_drafts hoặc campaigns
+    const targetProduct = products.find((p) => p.id === id);
+    const isLinkedToScript = scripts.some((s) => s.productId === id);
+    const isLinkedToCampaign = campaigns.some((c) => c.productName === targetProduct?.name);
+
+    if (isLinkedToScript) {
+      addToast('Không thể xóa: Sản phẩm này đã được liên kết với kịch bản trong Xưởng Kịch Bản!', 'warning');
+      return;
+    }
+    if (isLinkedToCampaign) {
+      addToast('Không thể xóa: Sản phẩm này đang được chạy trong Chiến Dịch (Campaign Center)!', 'warning');
+      return;
+    }
+
     if (isSupabaseConfigured() && !id.startsWith('prod-0')) {
       const { success, error } = await productService.deleteProduct(id);
       if (!success && error) {
@@ -445,6 +459,34 @@ export function useAffiliateStore() {
     setProducts((prev) => prev.filter((p) => p.id !== id));
     addToast('Đã xóa sản phẩm thành công!', 'success');
     addSystemLog('info', 'Scout AI', `Đã xóa deal sản phẩm ID: ${id}`);
+  }, [products, scripts, campaigns, addToast, addSystemLog]);
+
+  const addMultipleProducts = useCallback(async (newItems: ProductItem[]) => {
+    if (newItems.length === 0) return;
+    let savedCount = 0;
+    const addedList: ProductItem[] = [];
+
+    for (const item of newItems) {
+      if (isSupabaseConfigured()) {
+        const { data: dbItem, error } = await productService.createProduct(item);
+        if (dbItem && !error) {
+          savedCount++;
+          addedList.push(dbItem);
+        } else {
+          addedList.push(item);
+        }
+      } else {
+        addedList.push(item);
+      }
+    }
+
+    setProducts((prev) => [...addedList, ...prev]);
+    if (savedCount > 0) {
+      addToast(`Đã nhập thành công ${newItems.length} sản phẩm (${savedCount} lưu Supabase)!`, 'success');
+    } else {
+      addToast(`Đã nhập ${newItems.length} sản phẩm vào danh sách!`, 'success');
+    }
+    addSystemLog('success', 'Scout AI', `Nhập hàng loạt ${newItems.length} sản phẩm từ file CSV.`);
   }, [addToast, addSystemLog]);
 
   // Content Factory actions
@@ -732,6 +774,7 @@ ${script.hashtags.join(' ')}
     products: filteredProducts,
     allProductsCount: products.length,
     addCustomProduct,
+    addMultipleProducts,
     updateCustomProduct,
     deleteCustomProduct,
     sendProductToScriptFactory,

@@ -99,8 +99,13 @@ export const AiManagerModule: React.FC<AiManagerModuleProps> = ({
     data: any;
     error?: string;
     fallbackReason?: string | null;
+    requestedAgent?: string;
+    executedAgent?: string;
     usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+    costStatus?: 'actual' | 'estimated' | 'unknown';
+    actualCostVND?: number | null;
     estimatedCostVND?: number;
+    pricingMetadata?: { version: string; updatedDate: string };
     durationMs?: number;
   } | null>(null);
 
@@ -266,14 +271,19 @@ export const AiManagerModule: React.FC<AiManagerModuleProps> = ({
           success: true,
           data: res.data,
           fallbackReason: res.fallbackReason,
+          requestedAgent: res.requestedAgent,
+          executedAgent: res.executedAgent,
           usage: res.usage,
+          costStatus: res.costStatus,
+          actualCostVND: res.actualCostVND,
           estimatedCostVND: res.estimatedCostVND,
+          pricingMetadata: res.pricingMetadata,
           durationMs: res.durationMs
         });
 
-        // Cập nhật số token và chi phí local
+        // Cập nhật số token và chi phí local (ưu tiên actualCostVND nếu có)
         const tokensAdded = res.usage?.totalTokens || 650;
-        const costAdded = res.estimatedCostVND || 85;
+        const costAdded = res.actualCostVND ?? res.estimatedCostVND ?? 85;
 
         setLocalAgents((prev) =>
           prev.map((a) => {
@@ -786,17 +796,39 @@ export const AiManagerModule: React.FC<AiManagerModuleProps> = ({
 
             {testResult.success ? (
               <div className="space-y-2">
-                <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 text-emerald-300 text-xs flex items-center justify-between">
+                <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 text-emerald-300 text-xs flex flex-wrap items-center justify-between gap-2">
                   <span className="flex items-center gap-1.5">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                     <span>Đã nhận phản hồi thành công qua {testResult.provider || 'AI Provider'}!</span>
                   </span>
-                  {testResult.estimatedCostVND !== undefined && (
-                    <span className="font-mono font-bold text-cyan-300">
-                      ~{testResult.estimatedCostVND}đ
-                    </span>
-                  )}
+                  <div>
+                    {testResult.costStatus === 'actual' && testResult.actualCostVND !== null && testResult.actualCostVND !== undefined ? (
+                      <span className="font-mono font-bold text-emerald-300 bg-emerald-900/60 px-2 py-0.5 rounded text-[11px] border border-emerald-700/60" title={`Kiểm định từ bảng giá provider ${testResult.pricingMetadata?.updatedDate || '2025-11-01'}`}>
+                        Thực tế: {testResult.actualCostVND.toLocaleString()}đ
+                      </span>
+                    ) : testResult.costStatus === 'estimated' ? (
+                      <span className="font-mono text-cyan-300 bg-cyan-950/60 px-2 py-0.5 rounded text-[11px] border border-cyan-800/60" title="Ước tính theo độ dài token/ký tự">
+                        Ước tính: ~{(testResult.estimatedCostVND || 0).toLocaleString()}đ
+                      </span>
+                    ) : (
+                      <span className="font-mono text-slate-400 bg-slate-800/60 px-2 py-0.5 rounded text-[10px]">
+                        Chưa đủ dữ liệu chi phí
+                      </span>
+                    )}
+                  </div>
                 </div>
+
+                {/* Agent Routing Info if fallback occurred */}
+                {testResult.requestedAgent && testResult.executedAgent && testResult.requestedAgent !== testResult.executedAgent && (
+                  <div className="p-2 rounded-lg bg-blue-950/30 border border-blue-800/40 text-[11px] text-blue-300 flex items-center justify-between font-mono">
+                    <span className="text-slate-400">Định tuyến thực thi:</span>
+                    <span>
+                      <span className="text-amber-300 font-bold">{testResult.requestedAgent.toUpperCase()}</span>
+                      <span className="text-slate-400 mx-1.5">➔</span>
+                      <span className="text-emerald-300 font-bold">{testResult.executedAgent.toUpperCase()}</span>
+                    </span>
+                  </div>
+                )}
 
                 {/* Token Usage Stats */}
                 {testResult.usage && (

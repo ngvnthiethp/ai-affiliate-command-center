@@ -69,41 +69,278 @@ Truy cập **Supabase Dashboard** > **Edge Functions** > **Secrets** (hoặc tab
 
 ---
 
-## 4. (Tùy Chọn) Migration Database Cho AI Brain Columns
+## 4. (Khuyên Dùng) Migration Database & Hàm Atomic Quota (SQL Editor)
 
-Nếu bạn muốn bảng `ai_task_logs` lưu riêng các cột: `agent`, `provider`, `model`, `input_tokens`, `output_tokens`, `estimated_cost`, hãy mở mục **SQL Editor** trên Supabase Dashboard và chạy đoạn mã không phá hủy (additive) sau:
+Mở **Supabase Dashboard** > **SQL Editor** và chạy đoạn mã không phá hủy (additive) dưới đây (cũng có trong file `supabase/migrations/20261101_ai_brain_columns.sql`):
 
 ```sql
+-- 1. Bổ sung các cột theo dõi chi tiết AI Brain (hoàn toàn Additive)
 ALTER TABLE public.ai_task_logs 
   ADD COLUMN IF NOT EXISTS owner_id uuid REFERENCES auth.users(id) ON DELETE CASCADE,
   ADD COLUMN IF NOT EXISTS request_id text,
   ADD COLUMN IF NOT EXISTS agent text,
+  ADD COLUMN IF NOT EXISTS requested_agent text,
+  ADD COLUMN IF NOT EXISTS executed_agent text,
   ADD COLUMN IF NOT EXISTS provider text,
   ADD COLUMN IF NOT EXISTS model text,
   ADD COLUMN IF NOT EXISTS input_tokens integer DEFAULT 0,
   ADD COLUMN IF NOT EXISTS output_tokens integer DEFAULT 0,
   ADD COLUMN IF NOT EXISTS estimated_cost numeric(12, 4) DEFAULT 0,
   ADD COLUMN IF NOT EXISTS actual_cost numeric(12, 4),
+  ADD COLUMN IF NOT EXISTS cost_status text DEFAULT 'estimated',
+  ADD COLUMN IF NOT EXISTS fallback_reason text,
   ADD COLUMN IF NOT EXISTS duration_ms integer DEFAULT 0,
   ADD COLUMN IF NOT EXISTS error_message text;
 
+-- 2. Đảm bảo request_id là duy nhất (ngăn chặn duplicate logging từ một request)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_task_logs_request_id_unique 
+  ON public.ai_task_logs(request_id) 
+  WHERE request_id IS NOT NULL;
+
+-- 3. Đánh index hỗ trợ tính toán Quota & Chi phí tốc độ cao
 CREATE INDEX IF NOT EXISTS idx_ai_task_logs_owner_created 
   ON public.ai_task_logs(owner_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ai_task_logs_created_at 
+  ON public.ai_task_logs(created_at DESC);
+
+-- 4. Kích hoạt Row Level Security (RLS) bảo vệ dữ liệu cá nhân
+ALTER TABLE public.ai_task_logs ENABLE ROW LEVEL SECURITY;
+
+DO $$ 
+BEGIN
+  -- Policy SELECT: User chỉ xem logs của chính mình
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies 
+    WHERE tablename = 'ai_task_logs' AND policyname = 'Users can view own ai task logs'
+  ) THEN
+    CREATE POLICY "Users can view own ai task logs" 
+      ON public.ai_task_logs 
+      FOR SELECT 
+      USING (auth.uid() = owner_id OR owner_id IS NULL);
+  END IF;
+
+  -- Policy INSERT: User chỉ ghi logs của chính mình
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies 
+    WHERE tablename = 'ai_task_logs' AND policyname = 'Users can insert own ai task logs'
+  ) THEN
+    CREATE POLICY "Users can insert own ai task logs" 
+      ON public.ai_task_logs 
+      FOR INSERT 
+      WITH CHECK (auth.uid() = owner_id OR owner_id IS NULL);
+  END IF;
+
+  -- Policy UPDATE: Cho phép cập nhật bản ghi đặt chỗ quota (Reservation -> Success/Failed)
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies 
+    WHERE tablename = 'ai_task_logs' AND policyname = 'Users can update own ai task logs'
+  ) THEN
+    CREATE POLICY "Users can update own ai task logs" 
+      ON public.ai_task_logs 
+      FOR UPDATE 
+      USING (auth.uid() = owner_id OR owner_id IS NULL)
+      WITH CHECK (auth.uid() = owner_id OR owner_id IS NULL);
+  END IF;
+END $$;
+
+-- 5. HÀM ATOMIC QUOTA RESERVATION (Chống Race Condition Tuyệt Đối)
+CREATE OR REPLACE FUNCTION public.reserve_ai_quota(
+  p_owner_id uuid,
+  p_request_id text,
+  p_daily_limit int DEFAULT 20,
+  p_monthly_budget_vnd numeric DEFAULT 300000
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, auth
+AS $$
+DECLARE
+  v_today_start timestamptz := date_trunc('day', now());
+  v_month_start timestamptz := date_trunc('month', now());
+  v_current_daily_count int;
+  v_current_monthly_spent numeric;
+BEGIN
+  -- Khóa mức transaction theo user ID để chặn race condition
+  PERFORM pg_advisory_xact_lock(hashtext(COALESCE(p_owner_id::text, 'acc_ai_quota_lock')));
+
+  -- Đếm số tác vụ hôm nay: bao gồm 'success', 'running', 'reserved'
+  SELECT COUNT(*)
+  INTO v_current_daily_count
+  FROM public.ai_task_logs
+  WHERE created_at >= v_today_start
+    AND (owner_id = p_owner_id OR (owner_id IS NULL AND p_owner_id IS NULL))
+    AND status IN ('success', 'running', 'reserved');
+
+  IF v_current_daily_count >= p_daily_limit THEN
+    RETURN jsonb_build_object(
+      'allowed', false,
+      'code', 'QUOTA_EXCEEDED',
+      'error', 'Hạn mức AI hôm nay đã đạt tối đa (' || v_current_daily_count || '/' || p_daily_limit || ' tác vụ). Vui lòng thử lại vào ngày mai.',
+      'daily_count', v_current_daily_count,
+      'daily_limit', p_daily_limit
+    );
+  END IF;
+
+  -- Kiểm tra ngân sách tháng (300.000 VNĐ)
+  SELECT COALESCE(SUM(COALESCE(actual_cost, estimated_cost, 0)), 0)
+  INTO v_current_monthly_spent
+  FROM public.ai_task_logs
+  WHERE created_at >= v_month_start
+    AND (owner_id = p_owner_id OR (owner_id IS NULL AND p_owner_id IS NULL))
+    AND status = 'success';
+
+  IF v_current_monthly_spent >= p_monthly_budget_vnd THEN
+    RETURN jsonb_build_object(
+      'allowed', false,
+      'code', 'BUDGET_EXCEEDED',
+      'error', 'Ngân sách AI tháng này đã đạt (' || ROUND(v_current_monthly_spent) || '/' || p_monthly_budget_vnd || ' VNĐ).',
+      'monthly_spent', v_current_monthly_spent,
+      'monthly_budget', p_monthly_budget_vnd
+    );
+  END IF;
+
+  -- Ghi nhận giữ chỗ nguyên tử (Atomic Reservation) với request_id duy nhất
+  IF NOT EXISTS (SELECT 1 FROM public.ai_task_logs WHERE request_id = p_request_id) THEN
+    INSERT INTO public.ai_task_logs (
+      owner_id,
+      request_id,
+      task_type,
+      status,
+      created_at
+    ) VALUES (
+      p_owner_id,
+      p_request_id,
+      'Đang giữ chỗ quota (AI Task Reserved)',
+      'reserved',
+      now()
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'allowed', true,
+    'code', 'OK',
+    'daily_count', v_current_daily_count + 1,
+    'daily_limit', p_daily_limit,
+    'monthly_spent', v_current_monthly_spent,
+    'monthly_budget', p_monthly_budget_vnd
+  );
+END;
+$$;
 ```
 
-*(Lưu ý: Nếu không chạy migration này, Edge Function vẫn tự động fallback an toàn lưu thông tin vào 2 cột gốc `task_type` và `status` mà không gây bất kỳ lỗi nào!)*
+*(Lưu ý: Nếu chưa chạy migration này, Edge Function vẫn tự động fallback an toàn qua truy vấn thông thường mà không làm hỏng ứng dụng!)*
+
+---
+
+## 4.2. Migration Database Cho Phase 4: Product Hunter & Intelligence Engine
+
+Để lưu trữ đầy đủ các chỉ số phân tích chuyên sâu của Phase 4 (Điểm cơ hội 6 tiêu chí, phân tích đối thủ, chân dung khách hàng, độ tin cậy dữ liệu), mở **SQL Editor** trên Supabase Dashboard và chạy đoạn mã không phá hủy sau:
+
+```sql
+-- 1. Bổ sung các cột mở rộng cho bảng public.products
+ALTER TABLE public.products 
+  ADD COLUMN IF NOT EXISTS owner_id uuid REFERENCES auth.users(id) ON DELETE CASCADE,
+  ADD COLUMN IF NOT EXISTS original_price numeric DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS description text,
+  ADD COLUMN IF NOT EXISTS usp text,
+  ADD COLUMN IF NOT EXISTS rating numeric(3, 2) DEFAULT 5.0,
+  ADD COLUMN IF NOT EXISTS review_count integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS sold_count integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS source_type text DEFAULT 'manual',
+  ADD COLUMN IF NOT EXISTS source_url text,
+  ADD COLUMN IF NOT EXISTS data_source text DEFAULT 'Manual Input',
+  ADD COLUMN IF NOT EXISTS collected_at timestamptz DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS data_reliability integer DEFAULT 70,
+  ADD COLUMN IF NOT EXISTS analysis_result jsonb,
+  ADD COLUMN IF NOT EXISTS score_breakdown jsonb,
+  ADD COLUMN IF NOT EXISTS competitors jsonb DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS is_favorite boolean DEFAULT false,
+  ADD COLUMN IF NOT EXISTS pipeline_status text DEFAULT 'DISCOVERED',
+  ADD COLUMN IF NOT EXISTS last_analyzed_at timestamptz;
+
+-- 2. Indexes để tăng tốc lọc và sắp xếp
+CREATE INDEX IF NOT EXISTS idx_products_owner_pipeline 
+  ON public.products(owner_id, pipeline_status);
+
+CREATE INDEX IF NOT EXISTS idx_products_potential_score 
+  ON public.products(potential_score DESC);
+
+CREATE INDEX IF NOT EXISTS idx_products_platform 
+  ON public.products(platform);
+
+CREATE INDEX IF NOT EXISTS idx_products_created_at 
+  ON public.products(created_at DESC);
+
+-- 3. Kích hoạt Row Level Security (RLS) bảo vệ sản phẩm riêng tư
+ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+
+DO $$ 
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies 
+    WHERE tablename = 'products' AND policyname = 'Users can view own products or public demo'
+  ) THEN
+    CREATE POLICY "Users can view own products or public demo" 
+      ON public.products 
+      FOR SELECT 
+      USING (auth.uid() = owner_id OR owner_id IS NULL);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies 
+    WHERE tablename = 'products' AND policyname = 'Users can insert own products'
+  ) THEN
+    CREATE POLICY "Users can insert own products" 
+      ON public.products 
+      FOR INSERT 
+      WITH CHECK (auth.uid() = owner_id OR owner_id IS NULL);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies 
+    WHERE tablename = 'products' AND policyname = 'Users can update own products'
+  ) THEN
+    CREATE POLICY "Users can update own products" 
+      ON public.products 
+      FOR UPDATE 
+      USING (auth.uid() = owner_id OR owner_id IS NULL)
+      WITH CHECK (auth.uid() = owner_id OR owner_id IS NULL);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies 
+    WHERE tablename = 'products' AND policyname = 'Users can delete own products'
+  ) THEN
+    CREATE POLICY "Users can delete own products" 
+      ON public.products 
+      FOR DELETE 
+      USING (auth.uid() = owner_id OR owner_id IS NULL);
+  END IF;
+END $$;
+```
+
+*(Lưu ý: Ứng dụng đã được tích hợp cơ chế tự động fallback thông minh; nếu chưa kịp chạy script trên, tính năng Thêm/Sửa sản phẩm vẫn hoạt động an toàn mà không phát sinh lỗi!)*
 
 ---
 
 ## 5. Toàn Bộ Mã Nguồn Đơn Tệp (Copy-Paste Cho `generate-content`)
 
-Sao chép toàn bộ khối mã dưới đây:
+File nguồn chính thức của hàm này nằm tại: **`supabase/functions/generate-content/index.ts`** trong thư mục dự án.
+Nếu triển khai bằng Supabase CLI, chỉ cần chạy:
+```bash
+supabase functions deploy generate-content --no-verify-jwt
+```
+*(Lưu ý: JWT được hàm tự xác thực an toàn bằng `supabaseClient.auth.getUser()`).*
+
+Nếu triển khai thủ công trên Supabase Dashboard, hãy sao chép toàn bộ nội dung từ file `supabase/functions/generate-content/index.ts` hoặc sao chép khối mã dưới đây dán vào editor của Edge Function:
 
 ```typescript
 // Supabase Edge Function: generate-content
-// Phase 3: AI Brain & Multi-Agent Orchestration (Deno Runtime)
+// Phase 3 Hardened: AI Brain & Multi-Agent Orchestration (Deno Runtime)
 // Điều phối 5 AI Agent: ChatGPT (OpenAI), Gemini (Google), Grok (xAI), Claude (Anthropic), DeepSeek
-// Quản lý Provider, Router, Fallback thông minh, Giới hạn Quota 20 tasks/ngày và Ngân sách 300.000 VNĐ
+// Quản lý Provider, Router, Fallback thông minh, Atomic Quota Reservation & Giới hạn Ngân sách
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 

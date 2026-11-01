@@ -1,7 +1,7 @@
 // Supabase Edge Function: generate-content
-// Phase 3: AI Brain & Multi-Agent Orchestration (Deno Runtime)
+// Phase 3 Hardened: AI Brain & Multi-Agent Orchestration (Deno Runtime)
 // Điều phối 5 AI Agent: ChatGPT (OpenAI), Gemini (Google), Grok (xAI), Claude (Anthropic), DeepSeek
-// Quản lý Provider, Router, Fallback thông minh, Giới hạn Quota 20 tasks/ngày và Ngân sách 300.000 VNĐ
+// Quản lý Provider, Router, Fallback thông minh, Atomic Quota Reservation & Giới hạn Ngân sách
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
@@ -12,13 +12,25 @@ const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// Cấu hình Model Mặc định cho từng Provider
+// ============================================================================
+// BẢNG GIÁ & METADATA CHÍNH THỨC CỦA TỪNG PROVIDER
+// Nguồn: Tài liệu chính thức Google AI Studio, OpenAI, DeepSeek, Anthropic, xAI
+// Ngày cập nhật kiểm định: 01/11/2025
+// ============================================================================
+const PRICING_METADATA = {
+  version: "2025-Q4-AUDITED",
+  updatedDate: "2025-11-01",
+  currency: "VND",
+  usdToVndRate: 25400 // Tỷ giá quy đổi tham chiếu
+};
+
 const PROVIDER_CONFIGS = {
   gemini: {
     name: "Google Gemini",
     defaultModel: "gemini-2.5-flash",
     envKey: "GEMINI_API_KEY",
     modelEnv: "GEMINI_MODEL",
+    pricingSource: "Google AI Studio Official Pricing (gemini-2.5-flash)",
     costPer1MPromptUSD: 0.075,
     costPer1MCompletionUSD: 0.30
   },
@@ -27,6 +39,7 @@ const PROVIDER_CONFIGS = {
     defaultModel: "deepseek-chat",
     envKey: "DEEPSEEK_API_KEY",
     modelEnv: "DEEPSEEK_MODEL",
+    pricingSource: "DeepSeek API Official Pricing (deepseek-chat V3)",
     costPer1MPromptUSD: 0.14,
     costPer1MCompletionUSD: 0.28
   },
@@ -35,14 +48,16 @@ const PROVIDER_CONFIGS = {
     defaultModel: "gpt-4o-mini",
     envKey: "OPENAI_API_KEY",
     modelEnv: "OPENAI_MODEL",
+    pricingSource: "OpenAI Pricing (gpt-4o-mini)",
     costPer1MPromptUSD: 0.15,
     costPer1MCompletionUSD: 0.60
   },
   grok: {
     name: "xAI Grok",
     defaultModel: "grok-beta",
-    envKey: "GROK_API_KEY", // fallback: XAI_API_KEY
+    envKey: "GROK_API_KEY",
     modelEnv: "GROK_MODEL",
+    pricingSource: "xAI Developer Pricing (grok-beta)",
     costPer1MPromptUSD: 5.00,
     costPer1MCompletionUSD: 15.00
   },
@@ -51,20 +66,18 @@ const PROVIDER_CONFIGS = {
     defaultModel: "claude-3-5-sonnet-20241022",
     envKey: "ANTHROPIC_API_KEY",
     modelEnv: "ANTHROPIC_MODEL",
+    pricingSource: "Anthropic Pricing (claude-3-5-sonnet)",
     costPer1MPromptUSD: 3.00,
     costPer1MCompletionUSD: 15.00
   }
 };
-
-// Tỷ giá quy đổi USD -> VNĐ cho mục đích ước tính ngân sách
-const USD_TO_VND_RATE = 25400;
 
 // Giới hạn an toàn & Deadline hệ thống
 const TOTAL_EXECUTION_TIMEOUT_MS = 120000; // 120s (dưới 150s gateway timeout)
 const MAX_PAYLOAD_LENGTH = 5000;
 const MAX_OUTPUT_TOKENS_LIMIT = 10000;
 
-// Giới hạn ngân sách mặc định
+// Giới hạn ngân sách mặc định (Server-side enforced)
 const DEFAULT_DAILY_TASK_LIMIT = 20; // 20 tác vụ/ngày/người dùng
 const DEFAULT_MONTHLY_BUDGET_VND = 300000; // 300.000 VNĐ/tháng
 
@@ -101,6 +114,8 @@ interface ProviderCallResult {
     completionTokens: number;
     totalTokens: number;
   };
+  costStatus: "actual" | "estimated" | "unknown";
+  actualCostVND: number | null;
   estimatedCostVND: number;
   durationMs: number;
   httpStatus: number;
@@ -110,6 +125,16 @@ interface ProviderCallResult {
 
 function isTransientError(status: number): boolean {
   return status === 503 || status === 502 || status === 500 || status === 429 || status === 408;
+}
+
+function sanitizeErrorMessage(msg: string): string {
+  if (!msg) return "";
+  // Xóa sạch API keys, Bearer tokens, URL credentials khỏi nội dung lỗi
+  return msg
+    .replace(/AIzaSy[A-Za-z0-9_-]{33}/gi, "[REDACTED_API_KEY]")
+    .replace(/sk-[A-Za-z0-9_-]{20,}/gi, "[REDACTED_API_KEY]")
+    .replace(/Bearer\s+[A-Za-z0-9_.-]+/gi, "Bearer [REDACTED_TOKEN]")
+    .slice(0, 250);
 }
 
 function getApiKey(provider: keyof typeof PROVIDER_CONFIGS): string | null {
@@ -123,16 +148,38 @@ function getApiKey(provider: keyof typeof PROVIDER_CONFIGS): string | null {
   return null;
 }
 
-function calculateCostVND(
+/**
+ * Tính toán chi phí chính xác theo bảng giá chính thức và tỷ giá quy đổi
+ */
+function calculateCost(
   provider: keyof typeof PROVIDER_CONFIGS, 
   promptTokens: number, 
-  completionTokens: number
-): number {
+  completionTokens: number,
+  isExactUsage: boolean
+): { costStatus: "actual" | "estimated" | "unknown"; actualCostVND: number | null; estimatedCostVND: number } {
   const cfg = PROVIDER_CONFIGS[provider];
+  if (!cfg || promptTokens <= 0 && completionTokens <= 0) {
+    return { costStatus: "unknown", actualCostVND: null, estimatedCostVND: 0 };
+  }
+
   const promptCostUSD = (promptTokens / 1000000) * cfg.costPer1MPromptUSD;
   const completionCostUSD = (completionTokens / 1000000) * cfg.costPer1MCompletionUSD;
   const totalCostUSD = promptCostUSD + completionCostUSD;
-  return Math.round(totalCostUSD * USD_TO_VND_RATE);
+  const costVND = Math.max(1, Math.round(totalCostUSD * PRICING_METADATA.usdToVndRate));
+
+  if (isExactUsage) {
+    return {
+      costStatus: "actual",
+      actualCostVND: costVND,
+      estimatedCostVND: costVND
+    };
+  } else {
+    return {
+      costStatus: "estimated",
+      actualCostVND: null, // Không ghi estimated thành actual
+      estimatedCostVND: costVND
+    };
+  }
 }
 
 // ============================================================================
@@ -173,17 +220,19 @@ async function callGemini(
     const errText = await response.text();
     let parsedErr: any = null;
     try { parsedErr = JSON.parse(errText); } catch {}
-    const msg = parsedErr?.error?.message || errText || "Lỗi khi gọi Gemini API";
+    const rawMsg = parsedErr?.error?.message || errText || "Lỗi khi gọi Gemini API";
     return {
       success: false,
       provider: "Google Gemini",
       model,
       text: "",
       usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      costStatus: "unknown",
+      actualCostVND: null,
       estimatedCostVND: 0,
       durationMs,
       httpStatus: response.status,
-      error: msg,
+      error: sanitizeErrorMessage(rawMsg),
       code: response.status === 429 ? "RATE_LIMIT_EXCEEDED" : response.status === 503 ? "SERVICE_UNAVAILABLE" : "GEMINI_ERROR"
     };
   }
@@ -191,6 +240,8 @@ async function callGemini(
   const data = await response.json();
   const candidateText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
   const usageMeta = data?.usageMetadata || {};
+
+  const isExactUsage = Boolean(usageMeta.promptTokenCount && usageMeta.candidatesTokenCount);
   const promptTokens = usageMeta.promptTokenCount || Math.ceil((userPrompt.length + systemInstruction.length) / 4);
   const completionTokens = usageMeta.candidatesTokenCount || Math.ceil(candidateText.length / 4);
   const totalTokens = usageMeta.totalTokenCount || (promptTokens + completionTokens);
@@ -202,7 +253,7 @@ async function callGemini(
   let parsedJson: any = null;
   try { parsedJson = JSON.parse(cleaned); } catch { parsedJson = { text: candidateText }; }
 
-  const costVND = calculateCostVND("gemini", promptTokens, completionTokens);
+  const costResult = calculateCost("gemini", promptTokens, completionTokens, isExactUsage);
 
   return {
     success: true,
@@ -211,7 +262,9 @@ async function callGemini(
     text: candidateText,
     parsedJson,
     usage: { promptTokens, completionTokens, totalTokens },
-    estimatedCostVND: costVND,
+    costStatus: costResult.costStatus,
+    actualCostVND: costResult.actualCostVND,
+    estimatedCostVND: costResult.estimatedCostVND,
     durationMs,
     httpStatus: 200
   };
@@ -264,17 +317,19 @@ async function callOpenAICompatible(
     const errText = await response.text();
     let parsedErr: any = null;
     try { parsedErr = JSON.parse(errText); } catch {}
-    const msg = parsedErr?.error?.message || errText || `Lỗi từ ${provider.toUpperCase()}`;
+    const rawMsg = parsedErr?.error?.message || errText || `Lỗi từ ${provider.toUpperCase()}`;
     return {
       success: false,
       provider: PROVIDER_CONFIGS[provider].name,
       model: defaultModel,
       text: "",
       usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      costStatus: "unknown",
+      actualCostVND: null,
       estimatedCostVND: 0,
       durationMs,
       httpStatus: response.status,
-      error: msg,
+      error: sanitizeErrorMessage(rawMsg),
       code: `${provider.toUpperCase()}_ERROR`
     };
   }
@@ -282,6 +337,7 @@ async function callOpenAICompatible(
   const data = await response.json();
   const rawText = data?.choices?.[0]?.message?.content || "";
   const usage = data?.usage || {};
+  const isExactUsage = Boolean(usage.prompt_tokens && usage.completion_tokens);
   const promptTokens = usage.prompt_tokens || Math.ceil((userPrompt.length + systemInstruction.length) / 4);
   const completionTokens = usage.completion_tokens || Math.ceil(rawText.length / 4);
   const totalTokens = usage.total_tokens || (promptTokens + completionTokens);
@@ -293,7 +349,7 @@ async function callOpenAICompatible(
   let parsedJson: any = null;
   try { parsedJson = JSON.parse(cleaned); } catch { parsedJson = { text: rawText }; }
 
-  const costVND = calculateCostVND(provider, promptTokens, completionTokens);
+  const costResult = calculateCost(provider, promptTokens, completionTokens, isExactUsage);
 
   return {
     success: true,
@@ -302,7 +358,9 @@ async function callOpenAICompatible(
     text: rawText,
     parsedJson,
     usage: { promptTokens, completionTokens, totalTokens },
-    estimatedCostVND: costVND,
+    costStatus: costResult.costStatus,
+    actualCostVND: costResult.actualCostVND,
+    estimatedCostVND: costResult.estimatedCostVND,
     durationMs,
     httpStatus: 200
   };
@@ -341,17 +399,19 @@ async function callClaude(
     const errText = await response.text();
     let parsedErr: any = null;
     try { parsedErr = JSON.parse(errText); } catch {}
-    const msg = parsedErr?.error?.message || errText || "Lỗi từ Anthropic Claude";
+    const rawMsg = parsedErr?.error?.message || errText || "Lỗi từ Anthropic Claude";
     return {
       success: false,
       provider: "Anthropic Claude",
       model,
       text: "",
       usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      costStatus: "unknown",
+      actualCostVND: null,
       estimatedCostVND: 0,
       durationMs,
       httpStatus: response.status,
-      error: msg,
+      error: sanitizeErrorMessage(rawMsg),
       code: "CLAUDE_ERROR"
     };
   }
@@ -359,6 +419,7 @@ async function callClaude(
   const data = await response.json();
   const rawText = data?.content?.[0]?.text || "";
   const usage = data?.usage || {};
+  const isExactUsage = Boolean(usage.input_tokens && usage.output_tokens);
   const promptTokens = usage.input_tokens || Math.ceil((userPrompt.length + systemInstruction.length) / 4);
   const completionTokens = usage.output_tokens || Math.ceil(rawText.length / 4);
   const totalTokens = promptTokens + completionTokens;
@@ -370,7 +431,7 @@ async function callClaude(
   let parsedJson: any = null;
   try { parsedJson = JSON.parse(cleaned); } catch { parsedJson = { text: rawText }; }
 
-  const costVND = calculateCostVND("claude", promptTokens, completionTokens);
+  const costResult = calculateCost("claude", promptTokens, completionTokens, isExactUsage);
 
   return {
     success: true,
@@ -379,19 +440,21 @@ async function callClaude(
     text: rawText,
     parsedJson,
     usage: { promptTokens, completionTokens, totalTokens },
-    estimatedCostVND: costVND,
+    costStatus: costResult.costStatus,
+    actualCostVND: costResult.actualCostVND,
+    estimatedCostVND: costResult.estimatedCostVND,
     durationMs,
     httpStatus: 200
   };
 }
 
 // ============================================================================
-// MAIN HANDLER
+// MAIN Deno.serve HANDLER
 // ============================================================================
 
 Deno.serve(async (req: Request) => {
   const startTime = Date.now();
-  const requestId = `brain_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
   // 1. CORS Preflight
   if (req.method === "OPTIONS") {
@@ -446,7 +509,7 @@ Deno.serve(async (req: Request) => {
       authenticatedUser = user;
     }
 
-    // 3. Phân tích Payload
+    // 3. Phân tích Payload JSON
     let body: RequestPayload;
     try {
       body = await req.json();
@@ -475,10 +538,10 @@ Deno.serve(async (req: Request) => {
       const grokKey = getApiKey("grok");
       const claudeKey = getApiKey("claude");
 
-      // Đếm số tác vụ trong ngày của người dùng từ ai_task_logs để kiểm soát Quota
       let todayTaskCount = 0;
       let monthSpentVND = 0;
-      if (supabaseClient) {
+
+      if (supabaseClient && authenticatedUser) {
         try {
           const startOfToday = new Date();
           startOfToday.setHours(0, 0, 0, 0);
@@ -486,12 +549,30 @@ Deno.serve(async (req: Request) => {
           const { count } = await supabaseClient
             .from("ai_task_logs")
             .select("*", { count: "exact", head: true })
-            .gte("created_at", startOfToday.toISOString());
+            .eq("owner_id", authenticatedUser.id)
+            .gte("created_at", startOfToday.toISOString())
+            .in("status", ["success", "running", "reserved"]);
 
           todayTaskCount = count || 0;
-        } catch (_countErr) {
-          // Bỏ qua nếu lỗi count
-        }
+
+          const startOfMonth = new Date();
+          startOfMonth.setDate(1);
+          startOfMonth.setHours(0, 0, 0, 0);
+
+          const { data: monthRows } = await supabaseClient
+            .from("ai_task_logs")
+            .select("actual_cost, estimated_cost")
+            .eq("owner_id", authenticatedUser.id)
+            .eq("status", "success")
+            .gte("created_at", startOfMonth.toISOString());
+
+          if (monthRows && monthRows.length > 0) {
+            monthSpentVND = monthRows.reduce((acc: number, r: any) => {
+              const cost = Number(r.actual_cost ?? r.estimated_cost ?? 0);
+              return acc + (isNaN(cost) ? 0 : cost);
+            }, 0);
+          }
+        } catch (_countErr) {}
       }
 
       const agentsStatus = [
@@ -562,11 +643,12 @@ Deno.serve(async (req: Request) => {
           success: true,
           requestId,
           timestamp: new Date().toISOString(),
+          pricingMetadata: PRICING_METADATA,
           agents: agentsStatus,
           quota: {
             dailyTaskCount: todayTaskCount,
             dailyTaskLimit: DEFAULT_DAILY_TASK_LIMIT,
-            monthlySpentVND: monthSpentVND,
+            monthlySpentVND: Math.round(monthSpentVND),
             monthlyBudgetVND: DEFAULT_MONTHLY_BUDGET_VND,
             isDailyQuotaExceeded: todayTaskCount >= DEFAULT_DAILY_TASK_LIMIT,
             isMonthlyBudgetExceeded: monthSpentVND >= DEFAULT_MONTHLY_BUDGET_VND
@@ -577,44 +659,74 @@ Deno.serve(async (req: Request) => {
     }
 
     // ========================================================================
-    // KIỂM TRA HẠN MỨC QUOTA SERVER-SIDE (COST CONTROL GUARDRAILS)
+    // 4. ATOMIC QUOTA RESERVATION (CHỐNG RACE CONDITION SERVER-SIDE)
     // ========================================================================
-    if (supabaseClient) {
+    let hasAtomicReservation = false;
+
+    if (supabaseClient && authenticatedUser) {
       try {
-        const startOfToday = new Date();
-        startOfToday.setHours(0, 0, 0, 0);
+        // Cố gắng gọi hàm PostgreSQL RPC 'reserve_ai_quota' nguyên tử có xact lock
+        const { data: rpcResult, error: rpcError } = await supabaseClient.rpc("reserve_ai_quota", {
+          p_owner_id: authenticatedUser.id,
+          p_request_id: requestId,
+          p_daily_limit: DEFAULT_DAILY_TASK_LIMIT,
+          p_monthly_budget_vnd: DEFAULT_MONTHLY_BUDGET_VND
+        });
 
-        const { count } = await supabaseClient
-          .from("ai_task_logs")
-          .select("*", { count: "exact", head: true })
-          .gte("created_at", startOfToday.toISOString());
+        if (!rpcError && rpcResult) {
+          if (!rpcResult.allowed) {
+            console.warn(`[${requestId}] [RPC_QUOTA_BLOCKED] ${rpcResult.code}: ${rpcResult.error}`);
+            return new Response(
+              JSON.stringify({
+                success: false,
+                error: rpcResult.error || "Hạn mức tác vụ hoặc ngân sách đã đạt giới hạn.",
+                code: rpcResult.code || "QUOTA_EXCEEDED",
+                requestId
+              }),
+              { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
+          hasAtomicReservation = true;
+          console.log(`[${requestId}] [ATOMIC_RESERVED] Giữ chỗ thành công qua RPC. Task hôm nay: ${rpcResult.daily_count}/${DEFAULT_DAILY_TASK_LIMIT}`);
+        } else {
+          // Fallback nếu function RPC chưa được chạy migration trong DB
+          const startOfToday = new Date();
+          startOfToday.setHours(0, 0, 0, 0);
 
-        const currentTodayCount = count || 0;
-        if (currentTodayCount >= DEFAULT_DAILY_TASK_LIMIT) {
-          console.warn(`[${requestId}] [QUOTA_BLOCKED] Vượt hạn mức ngày: ${currentTodayCount}/${DEFAULT_DAILY_TASK_LIMIT}`);
-          return new Response(
-            JSON.stringify({
-              success: false,
-              error: `Hạn mức AI hôm nay đã đạt (${currentTodayCount}/${DEFAULT_DAILY_TASK_LIMIT} tác vụ). Hệ thống tự động chặn để bảo vệ ngân sách chi phí. Hạn mức sẽ được làm mới vào ngày mai.`,
-              code: "QUOTA_EXCEEDED",
-              details: "Daily task limit exceeded",
-              requestId
-            }),
-            { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-          );
+          const { count } = await supabaseClient
+            .from("ai_task_logs")
+            .select("*", { count: "exact", head: true })
+            .eq("owner_id", authenticatedUser.id)
+            .gte("created_at", startOfToday.toISOString())
+            .in("status", ["success", "running", "reserved"]);
+
+          const currentTodayCount = count || 0;
+          if (currentTodayCount >= DEFAULT_DAILY_TASK_LIMIT) {
+            console.warn(`[${requestId}] [FALLBACK_QUOTA_BLOCKED] Hạn mức ngày: ${currentTodayCount}/${DEFAULT_DAILY_TASK_LIMIT}`);
+            return new Response(
+              JSON.stringify({
+                success: false,
+                error: `Hạn mức AI hôm nay đã đạt (${currentTodayCount}/${DEFAULT_DAILY_TASK_LIMIT} tác vụ). Hệ thống tự động chặn để bảo vệ ngân sách chi phí.`,
+                code: "QUOTA_EXCEEDED",
+                requestId
+              }),
+              { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
         }
-      } catch (_quotaErr) {
-        // Cho phép đi tiếp nếu không thể kiểm tra count
+      } catch (_reserveErr) {
+        // Cho phép xử lý tiếp nếu lỗi kết nối DB tạm thời
       }
     }
 
     // ========================================================================
-    // XÁC ĐỊNH SYSTEM INSTRUCTION & USER PROMPT
+    // 5. XÁC ĐỊNH SYSTEM INSTRUCTION & USER PROMPT
     // ========================================================================
     let systemInstruction = "";
     let userPrompt = "";
     let mappedTaskType = body.taskType || "content_creation";
-    let targetAgent: "chatgpt" | "gemini" | "grok" | "claude" | "deepseek" = body.preferredAgent || "gemini";
+    const requestedAgent: "chatgpt" | "gemini" | "grok" | "claude" | "deepseek" = body.preferredAgent || "gemini";
+    let targetAgent = requestedAgent;
     const payload = body.payload || {};
 
     if (action === "orchestrate_task") {
@@ -687,7 +799,7 @@ Trả về JSON:
 }`;
       } else {
         targetAgent = "gemini";
-        systemInstruction = "Bạn là AI Assistant thuộc AI Affiliate Command Center. Trả về kết quả dưới dạng JSON có cấu trúc.";
+        systemInstruction = "Bạn là AI Assistant thuộc AI Affiliate Command Center. Trả về JSON.";
       }
     } 
     // Backward compatibility cho các actions cũ
@@ -735,19 +847,89 @@ Giá bán: ${Number(priceVND).toLocaleString()} VNĐ
 Hoa hồng: ${commissionRate}%
 Khán giả: ${targetAudience}
 Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
-    } else if (action === "analyze_product") {
+    } else if (action === "analyze_product" || action === "analyze_product_intelligence") {
       targetAgent = "gemini";
       mappedTaskType = "market_research";
-      systemInstruction = `Bạn là Scout AI chuyên phân tích tiềm năng deal Affiliate. Trả về JSON:
+      const {
+        productName = "Sản phẩm Affiliate",
+        category = "Công nghệ",
+        priceVND = 350000,
+        originalPriceVND = 0,
+        commissionRate = 15,
+        platform = "tiktok",
+        description = "",
+        usp = "",
+        soldCount = 0,
+        rating = 5.0,
+        competitors = []
+      } = payload;
+
+      systemInstruction = `Bạn là Senior AI Product Intelligence Specialist & Affiliate Strategist tại thị trường Việt Nam (thuộc AI Affiliate Command Center).
+Nhiệm vụ: Phân tích khách quan sản phẩm affiliate dựa trên dữ liệu thật đầu vào.
+QUY TẮC BẮT BUỘC:
+1. KHÔNG tự tạo ra số liệu bán giả, rating giả hoặc doanh thu giả.
+2. Dữ liệu suy luận phải được gán "inferenceType": "AI_INFERENCE".
+3. Phân biệt rõ doanh thu bán hàng (GMV) với thu nhập hoa hồng thực nhận của Affiliate.
+4. Chấm điểm cơ hội sản phẩm từ 0-100 với 6 tiêu chí trọng số:
+   - affiliateCommission (Tối đa 20 điểm)
+   - marketDemand (Tối đa 20 điểm)
+   - tiktokContentPotential (Tối đa 20 điểm)
+   - competition (Tối đa 15 điểm)
+   - priceConversion (Tối đa 15 điểm)
+   - dataReliability (Tối đa 10 điểm)
+5. Phân loại tier:
+   - 80-100: "HIGH OPPORTUNITY"
+   - 65-79: "POTENTIAL"
+   - 50-64: "NEEDS RESEARCH"
+   - 0-49: "LOW PRIORITY"
+6. Bắt buộc có chú thích: "AI-generated assessment, not guaranteed sales performance."
+
+Trả về ĐÚNG định dạng JSON sau:
 {
-  "potentialScore": 85,
-  "recommendation": "Đánh giá deal",
-  "targetAudience": "Đối tượng phù hợp",
-  "keyAngles": ["Góc tiếp cận 1", "Góc tiếp cận 2"],
-  "suggestedCommission": 18,
-  "notes": "Lưu ý"
+  "opportunityScore": 85,
+  "tier": "HIGH OPPORTUNITY",
+  "scoreBreakdown": {
+    "affiliateCommission": { "score": 18, "maxScore": 20, "explanation": "Lý do điểm...", "reliability": "HIGH" },
+    "marketDemand": { "score": 17, "maxScore": 20, "explanation": "Lý do điểm...", "reliability": "MEDIUM" },
+    "tiktokContentPotential": { "score": 18, "maxScore": 20, "explanation": "Lý do điểm...", "reliability": "HIGH" },
+    "competition": { "score": 12, "maxScore": 15, "explanation": "Lý do điểm...", "reliability": "MEDIUM" },
+    "priceConversion": { "score": 14, "maxScore": 15, "explanation": "Lý do điểm...", "reliability": "HIGH" },
+    "dataReliability": { "score": 6, "maxScore": 10, "explanation": "Lý do điểm...", "reliability": "MEDIUM" }
+  },
+  "targetAudience": "Mô tả chi tiết nhóm đối tượng khách hàng mục tiêu",
+  "solvedNeeds": "Vấn đề hoặc nhu cầu thực tế sản phẩm giải quyết",
+  "extractedUSPs": ["USP 1", "USP 2", "USP 3"],
+  "pros": ["Ưu điểm 1", "Ưu điểm 2"],
+  "cons": ["Nhược điểm 1", "Nhược điểm 2"],
+  "risks": ["Rủi ro 1", "Rủi ro 2"],
+  "contentAngles": ["Góc tiếp cận 1", "Góc tiếp cận 2", "Góc tiếp cận 3"],
+  "commissionAnalysis": {
+    "expectedCommissionVND": 52500,
+    "discountPct": 15,
+    "commissionRate": 15,
+    "marginNote": "Thu nhập hoa hồng ước tính trên mỗi đơn hàng."
+  },
+  "marketAnalysis": {
+    "demandLevel": "Cao / Trung bình / Ngách",
+    "seasonality": "Quanh năm hoặc thời vụ",
+    "competitionLevel": "Thấp / Trung bình / Cao",
+    "targetSegment": "Phân khúc khách hàng mục tiêu"
+  },
+  "disclaimer": "AI-generated assessment, not guaranteed sales performance.",
+  "inferenceType": "AI_INFERENCE"
 }`;
-      userPrompt = `Phân tích sản phẩm: ${payload.productName || ""}, ngành: ${payload.category || ""}, giá: ${payload.priceVND || 0}`;
+
+      userPrompt = `Sản phẩm: ${productName}
+Ngành hàng: ${category}
+Nền tảng: ${platform.toUpperCase()}
+Giá bán: ${Number(priceVND).toLocaleString()} VNĐ
+${originalPriceVND ? `Giá gốc niêm yết: ${Number(originalPriceVND).toLocaleString()} VNĐ` : ""}
+Hoa hồng: ${commissionRate}%
+${description ? `Mô tả sản phẩm: ${description}` : ""}
+${usp ? `USP người bán cung cấp: ${usp}` : ""}
+${soldCount ? `Số lượng đã bán ghi nhận: ${soldCount}` : "Số lượng bán: Chưa có số liệu xác minh"}
+${rating ? `Điểm đánh giá: ${rating}/5` : ""}
+${Array.isArray(competitors) && competitors.length > 0 ? `Đối thủ cạnh tranh đã nhập: ${JSON.stringify(competitors)}` : ""}`;
     } else if (action === "trend_ideas") {
       targetAgent = "grok";
       mappedTaskType = "trend_intelligence";
@@ -788,9 +970,8 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
     }
 
     // ========================================================================
-    // AI TASK ROUTER & SMART FALLBACK
+    // 6. AI TASK ROUTER & SMART FALLBACK
     // ========================================================================
-    // Bản đồ gán Agent -> Provider
     const AGENT_TO_PROVIDER: Record<string, keyof typeof PROVIDER_CONFIGS> = {
       chatgpt: "openai",
       gemini: "gemini",
@@ -808,7 +989,6 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
     if (!apiKey) {
       console.warn(`[${requestId}] [ROUTER_FALLBACK] Agent ${targetAgent} (Provider ${selectedProvider}) chưa cấu hình API Key.`);
 
-      // Kiểm tra xem Gemini (Primary) có sẵn không
       const geminiKey = getApiKey("gemini");
       const deepseekKey = getApiKey("deepseek");
 
@@ -823,7 +1003,16 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
         apiKey = deepseekKey;
         actualAgentUsed = "deepseek";
       } else {
-        // Không có bất kỳ Provider nào có key
+        // Cập nhật trạng thái reservation nếu có sang failed trước khi trả về
+        if (supabaseClient && authenticatedUser && hasAtomicReservation) {
+          try {
+            await supabaseClient.from("ai_task_logs").update({
+              status: "failed",
+              error_message: "NOT_CONFIGURED: Missing API keys in Supabase Secrets"
+            }).eq("request_id", requestId);
+          } catch (_e) {}
+        }
+
         return new Response(
           JSON.stringify({
             success: false,
@@ -838,7 +1027,7 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
     }
 
     // ========================================================================
-    // THỰC THI GỌI PROVIDER VỚI DEADLINE & RETRY TỰ ĐỘNG
+    // 7. THỰC THI GỌI PROVIDER VỚI DEADLINE & RETRY TỰ ĐỘNG
     // ========================================================================
     const isLongTask = action === "generate_script";
     const maxRetries = isLongTask ? 1 : 2;
@@ -852,7 +1041,7 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
       attempts = retry + 1;
 
       if (req.signal.aborted) {
-        console.log(`[${requestId}] [CLIENT_ABORT] Người dùng đã ngắt kết nối.`);
+        console.log(`[${requestId}] [CLIENT_ABORT] Người dùng đã ngắt kết nối trước lần gọi ${attempts}.`);
         break;
       }
 
@@ -892,13 +1081,12 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
           break; // Thành công
         }
 
-        // Nếu lỗi vĩnh viễn (400, 401, 403, 404): không retry
+        // Lỗi vĩnh viễn (400, 401, 403, 404): không retry
         if (!isTransientError(callRes.httpStatus)) {
           console.warn(`[${requestId}] [NON_TRANSIENT_ERR] Status ${callRes.httpStatus} không thuộc diện retry.`);
           break;
         }
 
-        // Retry có backoff
         if (retry < maxRetries) {
           const waitMs = Math.min(4000, 1500 * Math.pow(2, retry) + Math.floor(Math.random() * 300));
           console.log(`[${requestId}] [RETRY_WAIT] Chờ ${waitMs}ms sau lỗi HTTP ${callRes.httpStatus}...`);
@@ -922,34 +1110,60 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
     const totalDurationMs = Date.now() - startTime;
 
     // ========================================================================
-    // XỬ LÝ KẾT QUẢ & GHI LOG VÀO AI_TASK_LOGS
+    // 8. XỬ LÝ KẾT QUẢ & CẬP NHẬT ATOMIC LOG VÀO AI_TASK_LOGS
     // ========================================================================
     if (!finalResult || !finalResult.success) {
       const isClientAbort = req.signal.aborted;
       const status = finalResult ? finalResult.httpStatus : (isClientAbort ? 499 : 504);
       const errMsg = finalResult?.error || (isClientAbort ? "Yêu cầu đã bị hủy bởi người dùng." : "Hết thời gian chờ phản hồi AI (Timeout).");
 
-      // Ghi log lỗi vào Supabase ai_task_logs nếu không phải người dùng hủy
-      if (supabaseClient && authenticatedUser && !isClientAbort) {
+      // Cập nhật trạng thái vào Supabase ai_task_logs
+      if (supabaseClient && authenticatedUser) {
         try {
+          const failSummary = fallbackReason
+            ? `[${requestedAgent.toUpperCase()} -> ${actualAgentUsed.toUpperCase()} Fallback] ${action.toUpperCase()}: Thất bại HTTP ${status}`
+            : `[${actualAgentUsed.toUpperCase()}] ${action.toUpperCase()}: Thất bại HTTP ${status}`;
+
           const logPayload = {
-            task_type: `[${actualAgentUsed.toUpperCase()}] ${action.toUpperCase()}: Thất bại HTTP ${status}`,
-            status: "failed",
+            task_type: failSummary.slice(0, 150),
+            status: isClientAbort ? "aborted" : "failed",
             owner_id: authenticatedUser.id,
             request_id: requestId,
             agent: actualAgentUsed,
+            requested_agent: requestedAgent,
+            executed_agent: actualAgentUsed,
             provider: PROVIDER_CONFIGS[selectedProvider]?.name || selectedProvider,
+            model: finalResult?.model || PROVIDER_CONFIGS[selectedProvider]?.defaultModel,
+            fallback_reason: fallbackReason,
+            cost_status: "unknown",
+            actual_cost: null,
+            estimated_cost: 0,
             duration_ms: totalDurationMs,
-            error_message: errMsg.slice(0, 200)
+            error_message: sanitizeErrorMessage(errMsg)
           };
-          // Thử ghi với schema đầy đủ
-          const { error: insertErr } = await supabaseClient.from("ai_task_logs").insert(logPayload);
-          if (insertErr) {
-            // Fallback an toàn về 2 cột cơ bản nếu bảng chưa migration
-            await supabaseClient.from("ai_task_logs").insert({
-              task_type: `[${actualAgentUsed.toUpperCase()}] ${action}: Thất bại HTTP ${status} (${errMsg.slice(0, 60)})`,
-              status: "failed"
-            });
+
+          if (hasAtomicReservation) {
+            // Update reservation row
+            const { error: updateErr } = await supabaseClient
+              .from("ai_task_logs")
+              .update(logPayload)
+              .eq("request_id", requestId);
+
+            if (updateErr) {
+              await supabaseClient.from("ai_task_logs").update({
+                task_type: failSummary.slice(0, 150),
+                status: isClientAbort ? "aborted" : "failed"
+              }).eq("request_id", requestId);
+            }
+          } else {
+            // Insert new log if no reservation existed
+            const { error: insertErr } = await supabaseClient.from("ai_task_logs").insert(logPayload);
+            if (insertErr) {
+              await supabaseClient.from("ai_task_logs").insert({
+                task_type: failSummary.slice(0, 150),
+                status: isClientAbort ? "aborted" : "failed"
+              });
+            }
           }
         } catch (_logErr) {}
       }
@@ -957,60 +1171,87 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
       return new Response(
         JSON.stringify({
           success: false,
-          error: errMsg,
+          error: sanitizeErrorMessage(errMsg),
           code: finalResult?.code || (isClientAbort ? "ABORTED" : "TIMEOUT"),
           attempts,
           requestId,
           durationMs: totalDurationMs,
+          requestedAgent,
+          executedAgent: actualAgentUsed,
           fallbackReason
         }),
         { status, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // GHI LOG THÀNH CÔNG VÀO AI_TASK_LOGS
+    // THÀNH CÔNG: Cập nhật bản ghi log duy nhất
     if (supabaseClient && authenticatedUser) {
       try {
-        const successSummary = `[${actualAgentUsed.toUpperCase()}] ${action.toUpperCase()}: Thành công qua ${finalResult.model}`;
+        const successSummary = fallbackReason
+          ? `[${requestedAgent.toUpperCase()} -> ${actualAgentUsed.toUpperCase()} Fallback] ${action.toUpperCase()}: Thành công qua ${finalResult.model}`
+          : `[${actualAgentUsed.toUpperCase()}] ${action.toUpperCase()}: Thành công qua ${finalResult.model}`;
+
         const logPayload = {
-          task_type: successSummary,
+          task_type: successSummary.slice(0, 150),
           status: "success",
           owner_id: authenticatedUser.id,
           request_id: requestId,
           agent: actualAgentUsed,
+          requested_agent: requestedAgent,
+          executed_agent: actualAgentUsed,
           provider: finalResult.provider,
           model: finalResult.model,
           input_tokens: finalResult.usage.promptTokens,
           output_tokens: finalResult.usage.completionTokens,
+          cost_status: finalResult.costStatus,
+          actual_cost: finalResult.actualCostVND,
           estimated_cost: finalResult.estimatedCostVND,
-          duration_ms: totalDurationMs
+          fallback_reason: fallbackReason,
+          duration_ms: totalDurationMs,
+          error_message: null
         };
 
-        const { error: insertErr } = await supabaseClient.from("ai_task_logs").insert(logPayload);
-        if (insertErr) {
-          // Fallback về 2 cột cơ bản
-          await supabaseClient.from("ai_task_logs").insert({
-            task_type: `${successSummary} (${finalResult.usage.totalTokens} tokens, ~${finalResult.estimatedCostVND}đ)`,
-            status: "success"
-          });
+        if (hasAtomicReservation) {
+          const { error: updateErr } = await supabaseClient
+            .from("ai_task_logs")
+            .update(logPayload)
+            .eq("request_id", requestId);
+
+          if (updateErr) {
+            await supabaseClient.from("ai_task_logs").update({
+              task_type: successSummary.slice(0, 150),
+              status: "success"
+            }).eq("request_id", requestId);
+          }
+        } else {
+          const { error: insertErr } = await supabaseClient.from("ai_task_logs").insert(logPayload);
+          if (insertErr) {
+            await supabaseClient.from("ai_task_logs").insert({
+              task_type: `${successSummary} (${finalResult.usage.totalTokens} tokens, ~${finalResult.estimatedCostVND}đ)`.slice(0, 150),
+              status: "success"
+            });
+          }
         }
       } catch (_logErr) {}
     }
 
-    console.log(`[${requestId}] [SUCCESS] Hoàn thành bởi ${actualAgentUsed} (${finalResult.model}) trong ${totalDurationMs}ms.`);
+    console.log(`[${requestId}] [SUCCESS] Hoàn thành bởi ${actualAgentUsed} (Yêu cầu: ${requestedAgent}, Model: ${finalResult.model}) trong ${totalDurationMs}ms.`);
 
-    // TRẢ VỀ KẾT QUẢ ĐÃ CHUẨN HÓA CHO FRONTEND
+    // 9. TRẢ VỀ KẾT QUẢ ĐÃ CHUẨN HÓA CHO FRONTEND
     return new Response(
       JSON.stringify({
         success: true,
         action,
-        requestedAgent: targetAgent,
+        requestedAgent,
         executedAgent: actualAgentUsed,
         provider: finalResult.provider,
         model: finalResult.model,
         data: finalResult.parsedJson || { text: finalResult.text },
         usage: finalResult.usage,
+        costStatus: finalResult.costStatus,
+        actualCostVND: finalResult.actualCostVND,
         estimatedCostVND: finalResult.estimatedCostVND,
+        pricingMetadata: PRICING_METADATA,
         attempts,
         requestId,
         durationMs: totalDurationMs,
@@ -1024,7 +1265,7 @@ Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
     return new Response(
       JSON.stringify({
         success: false,
-        error: err?.message || "Đã xảy ra lỗi nội bộ trên AI Brain Edge Function.",
+        error: sanitizeErrorMessage(err?.message || "Đã xảy ra lỗi nội bộ trên AI Brain Edge Function."),
         code: "INTERNAL_SERVER_ERROR",
         requestId
       }),

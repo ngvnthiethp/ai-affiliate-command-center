@@ -127,7 +127,13 @@ export default function App() {
               onSelectProductForScript={store.sendProductToScriptFactory}
               onCopyLink={store.copyToClipboard}
               onAddProduct={store.addCustomProduct}
+              onAddMultipleProducts={store.addMultipleProducts}
               onUpdateProduct={store.updateCustomProduct}
+              onDeleteProduct={store.deleteCustomProduct}
+              currentUser={store.currentUser}
+              onOpenAuthModal={() => store.setIsAuthModalOpen(true)}
+              addToast={store.addToast}
+              addSystemLog={store.addSystemLog}
             />
           )}
 

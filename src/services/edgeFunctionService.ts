@@ -59,7 +59,15 @@ export interface EdgeFunctionResult<T> {
     completionTokens: number;
     totalTokens: number;
   };
+  costStatus?: 'actual' | 'estimated' | 'unknown';
+  actualCostVND?: number | null;
   estimatedCostVND?: number;
+  pricingMetadata?: {
+    version: string;
+    updatedDate: string;
+    currency: string;
+    usdToVndRate: number;
+  };
   error?: string | null;
   code?: string;
   details?: string;
@@ -295,7 +303,10 @@ export const edgeFunctionService = {
           executedAgent: data.executedAgent,
           fallbackReason: data.fallbackReason,
           usage: data.usage,
+          costStatus: data.costStatus,
+          actualCostVND: data.actualCostVND,
           estimatedCostVND: data.estimatedCostVND,
+          pricingMetadata: data.pricingMetadata,
           quota: data.quota,
           agents: data.agents,
           attempts: data.attempts || 1,
@@ -373,7 +384,7 @@ export const edgeFunctionService = {
   },
 
   /**
-   * Scout AI: Analyze affiliate deal potential
+   * Scout AI: Analyze affiliate deal potential (Legacy)
    */
   async analyzeProduct(
     params: {
@@ -385,6 +396,28 @@ export const edgeFunctionService = {
     options?: InvokeOptions
   ): Promise<EdgeFunctionResult<AIProductAnalysis>> {
     return this.invokeFunction<AIProductAnalysis>('analyze_product', params, options);
+  },
+
+  /**
+   * Phase 4: Product Intelligence & Opportunity Scoring Engine
+   */
+  async analyzeProductIntelligence(
+    params: {
+      productName: string;
+      category: string;
+      priceVND: number;
+      originalPriceVND?: number;
+      commissionRate?: number;
+      platform?: string;
+      description?: string;
+      usp?: string;
+      soldCount?: number;
+      rating?: number;
+      competitors?: any[];
+    },
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<any>> {
+    return this.invokeFunction<any>('analyze_product_intelligence', params, options);
   },
 
   /**
