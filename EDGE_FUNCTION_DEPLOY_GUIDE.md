@@ -9,32 +9,32 @@
 
 ---
 
-## 1. Kiến Trúc Bảo Mật & Cơ Chế Tự Động Retry Khi Quá Tải
+## 1. Kiến Trúc Bảo Mật & Đồng Bộ Timeout Toàn Hệ Thống
 
-1. **Frontend (Bảo mật tối đa)**:
+1. **Frontend (Bảo mật & Đồng bộ Deadline)**:
    - Chỉ sử dụng `VITE_SUPABASE_ANON_KEY` công khai.
    - **Tuyệt đối không lưu trữ hay gửi `GEMINI_API_KEY` hay `service_role key` ở Frontend**.
-   - Gửi yêu cầu qua `supabase.functions.invoke('generate-content', { body: { action, payload } })` kèm Bearer JWT Token của tài khoản đăng nhập.
-   - Khi gặp lỗi quá tải HTTP 503 từ máy chủ, Frontend tự động hiển thị tiến trình: `"Gemini đang quá tải. Đang thử lại lần 2/3…"` và khóa nút bấm chống gửi trùng lặp.
+   - Gửi yêu cầu qua `supabase.functions.invoke('generate-content', { body: { action, payload }, signal })` kèm Bearer JWT Token của tài khoản đăng nhập.
+   - **Đồng bộ Watchdog Timeout**: Frontend đặt hạn chót 125 giây, nhường quyền kiểm soát toàn bộ 120 giây cho Edge Function xử lý mà không bị abort sớm.
+   - Người dùng có thể nhấn nút **"Dừng & Hủy"** bất kỳ lúc nào để ngắt kết nối an toàn (`AbortController`).
 
 2. **Backend Supabase Edge Function (`generate-content`)**:
    - Chạy trên Deno runtime tại Cloud Edge của Supabase.
-   - Xác thực người dùng qua JWT `supabase.auth.getUser()`, từ chối truy cập (HTTP 401) nếu chưa đăng nhập.
-   - Giới hạn payload đầu vào (tối đa 5,000 ký tự) chống spam và lãng phí token.
-   - Đọc bí mật `GEMINI_API_KEY` an toàn từ `Deno.env.get('GEMINI_API_KEY')`.
-   - **Cơ chế Retry thông minh**: Tự động thử lại tối đa 3 lần với thuật toán **Exponential Backoff (1s, 2s, 4s) + Jitter ngẫu nhiên** và tôn trọng header `Retry-After` khi gặp các lỗi tạm thời:
-     - **HTTP 503** (High demand / Service Unavailable)
-     - **HTTP 502** (Bad Gateway)
-     - **HTTP 500** (Internal Server Error)
-     - **HTTP 429** (Rate Limit Exceeded)
-     - **HTTP 408** (Request Timeout)
-   - **Tuyệt đối KHÔNG retry** các lỗi vĩnh viễn: 400 (Bad Request), 401 (Unauthorized), 403 (Invalid API Key).
-   - Làm sạch markdown code fences (` ```json `) và parse JSON an toàn.
-   - Ghi nhật ký vào bảng `ai_task_logs` **duy nhất 1 lần** kèm số lần thử thực tế (không phát sinh log rác khi retry).
+   - **Tổng ngân sách thời gian**: `120,000ms` (120 giây, an toàn dưới giới hạn 150 giây idle timeout của Supabase Gateway).
+   - **Ngân sách từng lượt gọi Gemini**:
+     - Tác vụ sinh kịch bản (`generate_script`): cấp **55 giây** cho mỗi lượt gọi (đủ thời gian cho Gemini Flash sinh JSON chi tiết tiếng Việt 15-40s).
+     - Tác vụ ngắn (`analyze_product`, `audit_content`, `trend_ideas`): cấp **25 giây** cho mỗi lượt gọi.
+   - **Cơ chế Retry thông minh (Exponential Backoff + Jitter)**:
+     - Tối đa 1 lần retry cho `generate_script` nếu thời gian còn lại trước deadline tổng $\ge 40$ giây.
+     - Tối đa 2 lần retry cho các tác vụ ngắn nếu thời gian còn lại $\ge 15$ giây.
+     - **Chỉ retry lỗi tạm thời**: HTTP 503 (Quá tải), 502 (Bad Gateway), 500 (Lỗi máy chủ), 429 (Rate Limit), 408 (Timeout).
+     - **Tuyệt đối KHÔNG retry**: lỗi 400 (Bad Request), 401 (Unauthorized), 403 (Invalid API Key), hoặc khi người dùng đã chủ động hủy request (`AbortError`).
+   - Ghi nhật ký vào bảng `ai_task_logs` **duy nhất 1 lần** khi kết thúc thực sự (không phát sinh log rác).
+   - Logging chẩn đoán kèm `requestId` theo dõi từng chặng: bắt đầu, xác thực JWT, thời gian gọi Gemini, HTTP status, thời gian delay, tổng thời gian.
 
 3. **Quy Trình 2 Bước Tại Xưởng Kịch Bản (Content Factory)**:
-   - **Bước 1 (Xem trước & Chỉnh sửa)**: Gemini sinh kịch bản -> Trả kết quả về hiển thị trên Modal xem trước. Người dùng kiểm tra, chỉnh sửa tiêu đề, chọn Hook A/B, sửa lời thoại từng phân cảnh, CTA, hashtag.
-   - **Bước 2 (Xác nhận lưu)**: Chỉ khi người dùng bấm **"Lưu Kịch Bản Vào Bản Nháp (Supabase)"**, ứng dụng mới thực hiện lệnh INSERT vào bảng `content_drafts`. Tuyệt đối không lưu bản nháp rỗng nếu xảy ra lỗi.
+   - **Bước 1 (Xem trước & Chỉnh sửa)**: Gemini sinh kịch bản -> Trả kết quả về hiển thị trên Modal xem trước. Người dùng kiểm tra, chỉnh sửa tiêu đề, chọn Hook A/B, sửa lời thoại từng phân cảnh, CTA, hashtag, policy notes.
+   - **Bước 2 (Xác nhận lưu)**: Chỉ khi người dùng bấm **"Lưu Kịch Bản Vào Bản Nháp (Supabase)"**, ứng dụng mới thực hiện lệnh INSERT vào bảng `content_drafts`.
 
 ---
 
@@ -47,13 +47,13 @@
 
 ### Bước 2: Cấu hình Secrets trên Supabase Dashboard
 1. Truy cập [https://supabase.com/dashboard](https://supabase.com/dashboard) và chọn dự án của bạn.
-2. Tại menu bên trái (trên iPhone: bấm biểu tượng menu góc trên để mở thanh điều hướng), tìm đến mục **Edge Functions** (biểu tượng tia sét).
+2. Tại menu bên trái, tìm đến mục **Edge Functions** (biểu tượng tia sét).
 3. Bấm vào tab **Secrets** (hoặc chọn **Manage Secrets**).
 4. Bấm **Add new secret** và nhập 2 biến sau:
    - **Tên**: `GEMINI_API_KEY`  
      **Giá trị**: Dán mã Gemini API Key vừa lấy ở Bước 1.
    - **Tên**: `GEMINI_MODEL` *(tùy chọn)*  
-     **Giá trị**: `gemini-2.5-flash` (hoặc model Gemini tương thích đang mở).
+     **Giá trị**: `gemini-2.5-flash` (hoặc `gemini-3.8-flash`).
 5. Bấm **Save** để lưu.
 
 ### Bước 3: Tạo & Dán Code Function
@@ -114,11 +114,10 @@ interface RequestPayload {
 // Cấu hình Model Gemini: Mặc định dùng gemini-2.5-flash (hoặc cấu hình qua biến GEMINI_MODEL)
 const DEFAULT_MODEL = "gemini-2.5-flash";
 
-// Cấu hình cơ chế Retry an toàn cho Gemini API
-const MAX_RETRIES = 3; // Tối đa 3 lần thử lại sau lần gọi đầu tiên (tổng cộng tối đa 4 lần)
-const BASE_RETRY_DELAY_MS = 1000; // 1 giây ban đầu
-const MAX_RETRY_DELAY_MS = 6000; // Tối đa 6 giây cho một khoảng nghỉ
-const TOTAL_EXECUTION_TIMEOUT_MS = 45000; // Timeout tổng 45s bảo vệ Edge Function
+// Cấu hình deadline tổng: 120s (an toàn dưới 150s idle gateway timeout của Supabase)
+const TOTAL_EXECUTION_TIMEOUT_MS = 120000;
+const BASE_RETRY_DELAY_MS = 1500; // 1.5 giây ban đầu
+const MAX_RETRY_DELAY_MS = 5000; // Tối đa 5 giây cho một khoảng nghỉ
 
 /**
  * Kiểm tra xem mã trạng thái HTTP có thuộc diện lỗi tạm thời được phép retry hay không.
@@ -136,18 +135,20 @@ function getRetryAfterMs(headerValue: string | null): number | null {
   if (!headerValue) return null;
   const seconds = Number(headerValue);
   if (!isNaN(seconds) && seconds > 0) {
-    return Math.min(seconds * 1000, 8000);
+    return Math.min(seconds * 1000, 6000);
   }
   const dateMs = Date.parse(headerValue);
   if (!isNaN(dateMs)) {
     const diff = dateMs - Date.now();
-    return diff > 0 ? Math.min(diff, 8000) : null;
+    return diff > 0 ? Math.min(diff, 6000) : null;
   }
   return null;
 }
 
 Deno.serve(async (req: Request) => {
   const startTime = Date.now();
+  // Khởi tạo Request ID cho chẩn đoán log
+  const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
   // 1. Xử lý preflight CORS
   if (req.method === "OPTIONS") {
@@ -161,7 +162,8 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           success: false,
           error: "Chỉ hỗ trợ phương thức POST.",
-          code: "METHOD_NOT_ALLOWED"
+          code: "METHOD_NOT_ALLOWED",
+          requestId
         }),
         { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -170,12 +172,14 @@ Deno.serve(async (req: Request) => {
     // 3. Đọc Secrets an toàn từ Deno environment (KHÔNG BAO GIỜ để lộ ở frontend)
     const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
     if (!geminiApiKey || geminiApiKey.trim() === "") {
+      console.error(`[${requestId}] [CONFIG_ERROR] Chưa cấu hình GEMINI_API_KEY trong Supabase Secrets.`);
       return new Response(
         JSON.stringify({
           success: false,
           error: "Chưa cấu hình GEMINI_API_KEY trong Supabase Secrets.",
           code: "MISSING_GEMINI_KEY",
-          hint: "Vui lòng truy cập Supabase Dashboard > Edge Functions > Secrets và thêm GEMINI_API_KEY từ Google AI Studio."
+          hint: "Vui lòng truy cập Supabase Dashboard > Edge Functions > Secrets và thêm GEMINI_API_KEY từ Google AI Studio.",
+          requestId
         }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -184,13 +188,15 @@ Deno.serve(async (req: Request) => {
     const geminiModel = Deno.env.get("GEMINI_MODEL")?.trim() || DEFAULT_MODEL;
 
     // 4. Xác thực người dùng qua Supabase JWT Token
+    const authStartMs = Date.now();
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
       return new Response(
         JSON.stringify({
           success: false,
           error: "Yêu cầu chưa đăng nhập. Vui lòng đăng nhập tài khoản trước khi thực hiện tác vụ AI.",
-          code: "UNAUTHORIZED"
+          code: "UNAUTHORIZED",
+          requestId
         }),
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -202,7 +208,8 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           success: false,
           error: "Thiếu Bearer JWT token trong Authorization header.",
-          code: "UNAUTHORIZED"
+          code: "UNAUTHORIZED",
+          requestId
         }),
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -221,18 +228,21 @@ Deno.serve(async (req: Request) => {
 
       const { data: { user }, error: userError } = await supabaseClient.auth.getUser(token);
       if (userError || !user) {
+        console.warn(`[${requestId}] [AUTH_FAIL] JWT không hợp lệ: ${userError?.message}`);
         return new Response(
           JSON.stringify({
             success: false,
             error: "Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Vui lòng đăng nhập lại.",
             code: "UNAUTHORIZED",
-            details: userError?.message
+            details: userError?.message,
+            requestId
           }),
           { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
       authenticatedUser = user;
     }
+    const authDurationMs = Date.now() - authStartMs;
 
     // 5. Kiểm tra & Giới hạn dữ liệu đầu vào (Guardrails)
     let body: RequestPayload;
@@ -243,7 +253,8 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           success: false,
           error: "Payload gửi lên không đúng định dạng JSON.",
-          code: "INVALID_JSON"
+          code: "INVALID_JSON",
+          requestId
         }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -255,11 +266,14 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           success: false,
           error: "Thiếu trường 'action' trong request payload.",
-          code: "MISSING_ACTION"
+          code: "MISSING_ACTION",
+          requestId
         }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
+
+    console.log(`[${requestId}] [START] Action: ${action}, Model: ${geminiModel}, AuthTime: ${authDurationMs}ms`);
 
     // Giới hạn ký tự payload chống lạm dụng chi phí token (tối đa 5,000 ký tự)
     const payloadString = JSON.stringify(payload || {});
@@ -268,7 +282,8 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           success: false,
           error: "Dữ liệu đầu vào vượt quá giới hạn an toàn (tối đa 5,000 ký tự).",
-          code: "PAYLOAD_TOO_LARGE"
+          code: "PAYLOAD_TOO_LARGE",
+          requestId
         }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -346,47 +361,46 @@ Quy tắc: Đánh giá khách quan, trung thực, dựa trên hành vi mua hàng
 Trả về JSON cấu trúc:
 {
   "potentialScore": 85,
-  "recommendation": "Khuyên dùng đẩy mạnh" | "Cân nhắc thử nghiệm" | "Không tối ưu",
-  "targetAudience": "Nhóm đối tượng khách hàng tiềm năng chính (độ tuổi, hành vi mua sắm)",
-  "keyAngles": ["Góc tiếp cận 1", "Góc tiếp cận 2", "Góc tiếp cận 3"],
+  "recommendation": "Khuyến nghị góc tiếp cận ngắn gọn",
+  "targetAudience": "Đối tượng người mua tiềm năng nhất",
+  "keyAngles": ["Góc quay 1", "Góc tiếp cận 2", "Góc so sánh 3"],
   "suggestedCommission": 18,
-  "notes": "Nhận xét phân tích ngắn gọn, súc tích"
+  "notes": "Lưu ý về nguồn hàng, đối thủ cạnh tranh"
 }`;
 
-      userPrompt = `Phân tích sản phẩm: ${productName}, Ngành: ${category}, Giá: ${priceVND} VNĐ, Nền tảng: ${platform}.`;
+      userPrompt = `Phân tích sản phẩm: ${productName}, ngành hàng: ${category}, nền tảng: ${platform}, giá bán: ${Number(priceVND).toLocaleString("vi-VN")} VNĐ.`;
 
     } else if (action === "trend_ideas") {
       const { category = "Tổng hợp", platform = "tiktok" } = payload;
-      systemInstruction = `Bạn là Trend Hunter AI chuyên bắt sóng xu hướng shortform video tại Việt Nam.
-Đề xuất các ý tưởng video affiliate đang thịnh hành phù hợp thị hiếu người xem Việt.
+      systemInstruction = `Bạn là Trend Hunter AI chuyên bắt sóng xu hướng shortform video Việt Nam.
 Trả về JSON cấu trúc:
 {
   "trends": [
     {
-      "name": "Tên xu hướng (ví dụ: Thử thách 24h dùng đồ hời)",
-      "soundType": "Loại nhạc nền/âm thanh viral thích hợp",
-      "hookTemplate": "Mẫu câu hook 3 giây bắt trend",
-      "retentionTactic": "Bí quyết giữ chân người xem trên 3 giây đầu"
+      "name": "Tên trend",
+      "soundType": "Loại âm thanh/nhạc nền",
+      "hookTemplate": "Mẫu câu mở đầu giữ chân người xem",
+      "retentionTactic": "Mẹo kéo dài thời gian xem trung bình"
     }
   ]
 }`;
 
-      userPrompt = `Đề xuất 3 xu hướng affiliate video mới nhất cho ngành hàng "${category}" trên nền tảng ${platform}.`;
+      userPrompt = `Đề xuất 3 xu hướng video ngắn chuyển đổi cao cho ngành hàng: ${category} trên ${platform}.`;
 
     } else if (action === "audit_content") {
       const { title = "", scriptText = "" } = payload;
-      systemInstruction = `Bạn là Auditor AI - Chuyên gia kiểm duyệt chính sách nội dung của TikTok Shop và Shopee Việt Nam.
-Quét từ ngữ nhạy cảm, từ cấm gây bóp tương tác hoặc từ chối duyệt video affiliate.
+      systemInstruction = `Bạn là Auditor AI - Chuyên gia kiểm duyệt chính sách quảng cáo TikTok Shop và Shopee Việt Nam.
+Kiểm tra nghiêm ngặt từ cấm, cam kết sai sự thật, từ ngữ nhạy cảm y tế, bảo hành giả.
 Trả về JSON cấu trúc:
 {
-  "complianceScore": 92,
-  "status": "approved" | "needs_review",
-  "violations": ["Danh sách các từ hoặc câu có nguy cơ vi phạm kèm lý do"],
-  "suggestedFixes": ["Gợi ý cách diễn đạt an toàn thay thế"],
-  "summary": "Đánh giá tổng quan về tính tuân thủ"
+  "complianceScore": 90,
+  "status": "approved",
+  "violations": ["Danh sách các lỗi nếu có"],
+  "suggestedFixes": ["Cách sửa văn phong tuân thủ"],
+  "summary": "Đánh giá tổng quan an toàn tài khoản"
 }`;
 
-      userPrompt = `Kiểm duyệt nội dung sau:
+      userPrompt = `Kiểm duyệt kịch bản sau:
 Tiêu đề: ${title}
 Nội dung: ${scriptText}`;
 
@@ -407,15 +421,17 @@ Trả về JSON cấu trúc:
         JSON.stringify({
           success: false,
           error: `Tác vụ không hợp lệ: ${action}`,
-          code: "UNSUPPORTED_ACTION"
+          code: "UNSUPPORTED_ACTION",
+          requestId
         }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // 7. Gọi Gemini API với Cơ Chế Retry Tự Động (Exponential Backoff + Jitter)
+    // 7. Cấu Hình Đồng Bộ Timeout & Retry Tối Ưu
     const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiApiKey}`;
 
+    // Tối ưu hóa request payload: giới hạn maxOutputTokens vừa đủ chất lượng, tránh sinh lặp vô hạn
     const geminiRequestBody = {
       contents: [
         {
@@ -428,98 +444,143 @@ Trả về JSON cấu trúc:
       },
       generationConfig: {
         temperature: 0.7,
-        responseMimeType: "application/json"
+        responseMimeType: "application/json",
+        maxOutputTokens: 2500
       }
     };
 
+    // Quy tắc Timeout & Retry đồng bộ:
+    // - generate_script cần 15-40s để sinh JSON hoàn chỉnh. Cấp ngân sách 55s cho mỗi lần gọi đơn lẻ.
+    // - Tối đa 1 lần retry (tổng 2 lần gọi) cho kịch bản dài nếu còn đủ tối thiểu 40s trước deadline tổng 120s.
+    // - Các tác vụ ngắn (analyze, audit, titles): 25s mỗi lượt, tối đa 2 lần retry.
+    const isLongTask = action === "generate_script";
+    const maxAllowedRetries = isLongTask ? 1 : 2;
+    const SINGLE_CALL_TIMEOUT_MS = isLongTask ? 55000 : 25000;
+    const MIN_TIME_FOR_RETRY_MS = isLongTask ? 40000 : 15000;
+
     let lastResponse: Response | null = null;
     let lastError: any = null;
-    let attemptCount = 0; // Số lần đã gọi thực tế
+    let attemptCount = 0;
 
-    for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+    for (let retry = 0; retry <= maxAllowedRetries; retry++) {
       attemptCount = retry + 1;
 
-      // Kiểm tra tổng thời gian xử lý còn lại
-      const elapsedTotalMs = Date.now() - startTime;
-      const remainingTimeMs = TOTAL_EXECUTION_TIMEOUT_MS - elapsedTotalMs;
-      if (remainingTimeMs < 4000) {
-        // Hết thời gian an toàn cho Edge Function
+      // 1. Kiểm tra nếu client (người dùng) đã chủ động ngắt kết nối
+      if (req.signal.aborted) {
+        console.log(`[${requestId}] [CLIENT_ABORT] Client đã ngắt kết nối trước lượt gọi ${attemptCount}`);
+        lastError = new DOMException("Client request aborted by user", "AbortError");
         break;
       }
 
-      // Đặt timeout cho từng lần gọi đơn lẻ (tối đa 15s hoặc thời gian còn lại)
-      const perAttemptTimeoutMs = Math.min(15000, remainingTimeMs - 1000);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), perAttemptTimeoutMs);
+      // 2. Kiểm tra thời gian còn lại trước deadline tổng (120 giây)
+      const elapsedTotalMs = Date.now() - startTime;
+      const remainingTotalMs = TOTAL_EXECUTION_TIMEOUT_MS - elapsedTotalMs;
+
+      // Nếu lần retry này không đủ thời gian an toàn cho Gemini hoàn thành, dừng retry và trả lỗi lượt trước
+      if (retry > 0 && remainingTotalMs < MIN_TIME_FOR_RETRY_MS) {
+        console.log(`[${requestId}] [RETRY_SKIP] Thời gian còn lại ${remainingTotalMs}ms < ${MIN_TIME_FOR_RETRY_MS}ms. Dừng retry để tránh vượt deadline.`);
+        break;
+      }
+
+      // 3. Đặt timeout cho từng lần gọi đơn lẻ: 55s (không vượt quá thời gian còn lại trước deadline)
+      const perAttemptTimeoutMs = Math.min(SINGLE_CALL_TIMEOUT_MS, Math.max(5000, remainingTotalMs - 2000));
+      const attemptController = new AbortController();
+      const timeoutId = setTimeout(() => {
+        attemptController.abort(new DOMException(`Gemini call timed out after ${perAttemptTimeoutMs}ms`, "TimeoutError"));
+      }, perAttemptTimeoutMs);
+
+      // Nếu người dùng hủy kết nối HTTP trong khi đang chờ Gemini, chuyển tiếp abort sang attemptController
+      const onClientAbort = () => {
+        attemptController.abort(new DOMException("Client aborted request", "AbortError"));
+      };
+      req.signal.addEventListener("abort", onClientAbort, { once: true });
+
+      const callStartMs = Date.now();
+      console.log(`[${requestId}] [CALL_START] Lượt ${attemptCount}/${maxAllowedRetries + 1}, Budget: ${perAttemptTimeoutMs}ms, Tổng đã chạy: ${elapsedTotalMs}ms`);
 
       try {
         const response = await fetch(geminiEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(geminiRequestBody),
-          signal: controller.signal
+          signal: attemptController.signal
         });
+
         clearTimeout(timeoutId);
+        req.signal.removeEventListener("abort", onClientAbort);
 
+        const callDurationMs = Date.now() - callStartMs;
         lastResponse = response;
+        console.log(`[${requestId}] [CALL_RESP] Lượt ${attemptCount}: HTTP ${response.status} trong ${callDurationMs}ms`);
 
-        // Nếu thành công (HTTP 200 OK), thoát khỏi vòng lặp retry ngay lập tức
+        // Thành công: thoát vòng lặp ngay
         if (response.ok) {
           break;
         }
 
-        // Nếu gặp lỗi vĩnh viễn (400 Bad Request, 401 Unauthorized, 403 Forbidden / Invalid Key):
-        // KHÔNG RETRY, thoát ngay lập tức!
-        if (response.status === 400 || response.status === 401 || response.status === 403) {
+        // Lỗi vĩnh viễn (400, 401, 403, 404): KHÔNG RETRY
+        if (!isTransientError(response.status)) {
+          console.warn(`[${requestId}] [PERMANENT_ERROR] HTTP ${response.status} không thuộc diện retry.`);
           break;
         }
 
-        // Nếu là lỗi tạm thời (503 Quá tải, 502 Bad Gateway, 500 Server Error, 429 Rate Limit, 408 Timeout):
-        if (isTransientError(response.status)) {
-          if (retry < MAX_RETRIES) {
-            // Tính toán khoảng thời gian chờ (Exponential backoff: 1s, 2s, 4s + Jitter ngẫu nhiên)
-            const retryAfterHeader = response.headers.get("Retry-After");
-            const headerDelay = getRetryAfterMs(retryAfterHeader);
-
-            const expBackoff = Math.min(
-              MAX_RETRY_DELAY_MS,
-              BASE_RETRY_DELAY_MS * Math.pow(2, retry) + Math.floor(Math.random() * 300)
-            );
-            const waitDelayMs = headerDelay !== null ? Math.max(headerDelay, expBackoff) : expBackoff;
-
-            // Chờ trước khi thực hiện lần retry kế tiếp
-            await new Promise((resolve) => setTimeout(resolve, waitDelayMs));
-            continue;
+        // Lỗi tạm thời (503, 429, 502, 500, 408): kiểm tra điều kiện retry
+        if (retry < maxAllowedRetries) {
+          const timeLeftAfterCall = TOTAL_EXECUTION_TIMEOUT_MS - (Date.now() - startTime);
+          if (timeLeftAfterCall < MIN_TIME_FOR_RETRY_MS) {
+            console.log(`[${requestId}] [RETRY_SKIP] Thời gian còn lại ${timeLeftAfterCall}ms không đủ cho lượt retry tiếp theo.`);
+            break;
           }
-        } else {
-          // Các mã lỗi không xác định khác, không retry
-          break;
-        }
 
+          const retryAfterHeader = response.headers.get("Retry-After");
+          const headerDelay = getRetryAfterMs(retryAfterHeader);
+          const expBackoff = Math.min(
+            MAX_RETRY_DELAY_MS,
+            BASE_RETRY_DELAY_MS * Math.pow(2, retry) + Math.floor(Math.random() * 400)
+          );
+          const waitDelayMs = headerDelay !== null ? Math.min(headerDelay, 6000) : expBackoff;
+
+          console.log(`[${requestId}] [RETRY_WAIT] Chờ ${waitDelayMs}ms trước khi thử lại... (Lý do: HTTP ${response.status})`);
+          await new Promise((resolve) => setTimeout(resolve, waitDelayMs));
+          continue;
+        }
       } catch (fetchErr: any) {
         clearTimeout(timeoutId);
+        req.signal.removeEventListener("abort", onClientAbort);
         lastError = fetchErr;
+        const callDurationMs = Date.now() - callStartMs;
 
-        if (fetchErr.name === "AbortError") {
-          // Lần thử này bị timeout
-          if (retry < MAX_RETRIES) {
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-            continue;
+        const isClientAbort = req.signal.aborted || fetchErr?.message?.includes("Client aborted");
+        if (isClientAbort) {
+          console.log(`[${requestId}] [CLIENT_ABORT] Người dùng đã chủ động hủy sau ${callDurationMs}ms.`);
+          break; // Không retry khi người dùng chủ động hủy
+        }
+
+        console.warn(`[${requestId}] [CALL_ERROR] Lượt ${attemptCount} gặp lỗi (${fetchErr.name}: ${fetchErr.message}) sau ${callDurationMs}ms.`);
+
+        if (retry < maxAllowedRetries) {
+          const timeLeftAfterErr = TOTAL_EXECUTION_TIMEOUT_MS - (Date.now() - startTime);
+          if (timeLeftAfterErr < MIN_TIME_FOR_RETRY_MS) {
+            console.log(`[${requestId}] [RETRY_SKIP] Không đủ thời gian còn lại (${timeLeftAfterErr}ms) sau lỗi mạng.`);
+            break;
           }
-        } else {
-          // Lỗi mạng hoặc kết nối gián đoạn
-          if (retry < MAX_RETRIES) {
-            await new Promise((resolve) => setTimeout(resolve, 1000 + Math.floor(Math.random() * 200)));
-            continue;
-          }
+
+          const waitDelayMs = 1500 + Math.floor(Math.random() * 500);
+          console.log(`[${requestId}] [RETRY_WAIT] Chờ ${waitDelayMs}ms sau lỗi kết nối...`);
+          await new Promise((resolve) => setTimeout(resolve, waitDelayMs));
+          continue;
         }
       }
     }
 
     // 8. Xử lý phản hồi từ Gemini API sau các lượt thử
+    const totalElapsedMs = Date.now() - startTime;
+
     if (!lastResponse || !lastResponse.ok) {
-      // Xác định mã trạng thái lỗi cuối cùng
-      const status = lastResponse ? lastResponse.status : (lastError?.name === "AbortError" ? 504 : 502);
+      const isClientAbort = req.signal.aborted || lastError?.message?.includes("Client aborted");
+      const isTimeout = lastError?.name === "TimeoutError" || (lastError?.name === "AbortError" && !isClientAbort);
+      const status = lastResponse ? lastResponse.status : (isTimeout ? 504 : isClientAbort ? 499 : 502);
+
       let errText = "";
       let parsedErr: any = null;
 
@@ -533,11 +594,12 @@ Trả về JSON cấu trúc:
       }
 
       const rawDetailMessage = parsedErr?.error?.message || errText || lastError?.message || "";
+      console.error(`[${requestId}] [FAILURE] Status: ${status}, Lượt gọi: ${attemptCount}, Tổng thời gian: ${totalElapsedMs}ms, Detail: ${rawDetailMessage}`);
 
-      // Log duy nhất MỘT LẦN vào bảng ai_task_logs nếu thất bại
-      if (supabaseClient && authenticatedUser) {
+      // Ghi log duy nhất MỘT LẦN vào bảng ai_task_logs nếu thất bại (trừ trường hợp người dùng chủ động hủy)
+      if (supabaseClient && authenticatedUser && !isClientAbort) {
         try {
-          const failSummary = `[Edge Function] ${action.toUpperCase()}: Thất bại HTTP ${status} (đã thử ${attemptCount} lần)`;
+          const failSummary = `[Edge Function] ${action.toUpperCase()}: Thất bại HTTP ${status} (đã thử ${attemptCount} lượt, ${Math.round(totalElapsedMs / 1000)}s)`;
           await supabaseClient.from("ai_task_logs").insert({
             task_type: failSummary.slice(0, 150),
             status: "failed"
@@ -547,7 +609,22 @@ Trả về JSON cấu trúc:
         }
       }
 
-      // Phân loại mã lỗi chính xác theo yêu cầu hệ thống
+      // Xử lý hủy do người dùng
+      if (isClientAbort) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: "Yêu cầu đã bị hủy bởi người dùng.",
+            code: "ABORTED",
+            requestId,
+            attempts: attemptCount,
+            durationMs: totalElapsedMs
+          }),
+          { status: 499, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Phân loại mã lỗi chính xác
       // 401: Phiên đăng nhập không hợp lệ
       if (status === 401) {
         return new Response(
@@ -555,7 +632,8 @@ Trả về JSON cấu trúc:
             success: false,
             error: "Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Vui lòng đăng nhập lại.",
             code: "UNAUTHORIZED",
-            details: rawDetailMessage
+            details: rawDetailMessage,
+            requestId
           }),
           { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
@@ -569,7 +647,8 @@ Trả về JSON cấu trúc:
             error: "Khóa GEMINI_API_KEY hoặc quyền truy cập không hợp lệ. Vui lòng kiểm tra API Key trong Supabase Secrets.",
             code: "API_KEY_INVALID",
             hint: "Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets.",
-            details: rawDetailMessage
+            details: rawDetailMessage,
+            requestId
           }),
           { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
@@ -583,14 +662,15 @@ Trả về JSON cấu trúc:
             error: "Gemini API vượt hạn mức hoặc tốc độ yêu cầu (429 Rate Limit). Vui lòng thử lại sau ít phút hoặc nâng cấp quota.",
             code: "RATE_LIMIT_EXCEEDED",
             details: rawDetailMessage,
-            attempts: attemptCount
+            attempts: attemptCount,
+            requestId,
+            durationMs: totalElapsedMs
           }),
           { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
       // 503: Gemini đang quá tải (High demand / Service Unavailable)
-      // TUYỆT ĐỐI KHÔNG HIỂN THỊ "Kiểm tra GEMINI_API_KEY"
       if (status === 503) {
         return new Response(
           JSON.stringify({
@@ -598,21 +678,25 @@ Trả về JSON cấu trúc:
             error: "Gemini hiện đang quá tải. Vui lòng thử lại sau ít phút.",
             code: "SERVICE_UNAVAILABLE",
             details: rawDetailMessage || "This model is currently experiencing high demand. Spikes in demand are usually temporary.",
-            attempts: attemptCount
+            attempts: attemptCount,
+            requestId,
+            durationMs: totalElapsedMs
           }),
           { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
       // 504: Hết thời gian chờ (Timeout)
-      if (status === 504 || lastError?.name === "AbortError") {
+      if (status === 504 || isTimeout) {
         return new Response(
           JSON.stringify({
             success: false,
-            error: "Hết thời gian chờ phản hồi từ Google Gemini API (504 Gateway Timeout). Vui lòng thử lại.",
+            error: "Hết thời gian chờ phản hồi từ máy chủ AI (504 Gateway Timeout). Gemini đang xử lý chậm hơn bình thường. Vui lòng thử lại sau ít phút.",
             code: "TIMEOUT",
-            details: rawDetailMessage,
-            attempts: attemptCount
+            details: `Xử lý vượt quá thời gian cho phép sau ${attemptCount} lượt thử (${Math.round(totalElapsedMs / 1000)}s).`,
+            attempts: attemptCount,
+            requestId,
+            durationMs: totalElapsedMs
           }),
           { status: 504, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
@@ -625,7 +709,9 @@ Trả về JSON cấu trúc:
           error: `Lỗi máy chủ tạm thời từ dịch vụ Google Gemini (HTTP ${status}). Vui lòng thử lại sau ít phút.`,
           code: status === 502 ? "BAD_GATEWAY" : "SERVER_ERROR",
           details: rawDetailMessage,
-          attempts: attemptCount
+          attempts: attemptCount,
+          requestId,
+          durationMs: totalElapsedMs
         }),
         { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -633,16 +719,17 @@ Trả về JSON cấu trúc:
 
     // 9. Phân tích nội dung kết quả sinh ra từ Gemini
     const geminiData = await lastResponse.json();
-    const candidateText =
-      geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const candidateText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     if (!candidateText || candidateText.trim() === "") {
+      console.warn(`[${requestId}] [EMPTY_RESPONSE] Phản hồi từ Gemini không có text.`);
       return new Response(
         JSON.stringify({
           success: false,
           error: "Không nhận được phản hồi nội dung từ Gemini.",
           code: "EMPTY_AI_RESPONSE",
-          attempts: attemptCount
+          attempts: attemptCount,
+          requestId
         }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -661,7 +748,6 @@ Trả về JSON cấu trúc:
     try {
       parsedResult = JSON.parse(cleanedText);
     } catch {
-      // Nếu không parse được JSON hoàn chỉnh, đóng gói dưới dạng rawText
       parsedResult = { rawText: candidateText };
     }
 
@@ -670,7 +756,7 @@ Trả về JSON cấu trúc:
       try {
         const taskDescription = `[Edge Function] ${action.toUpperCase()}: ${
           payload?.productName || payload?.category || action
-        } (Thành công qua ${attemptCount} lần thử)`;
+        } (Thành công qua ${attemptCount} lượt, ${Math.round(totalElapsedMs / 1000)}s)`;
         await supabaseClient.from("ai_task_logs").insert({
           task_type: taskDescription.slice(0, 150),
           status: "success"
@@ -680,6 +766,8 @@ Trả về JSON cấu trúc:
       }
     }
 
+    console.log(`[${requestId}] [SUCCESS] Hoàn thành ${action} qua ${attemptCount} lượt trong ${totalElapsedMs}ms.`);
+
     // 11. Trả về kết quả hoàn chỉnh cho Frontend
     return new Response(
       JSON.stringify({
@@ -688,6 +776,8 @@ Trả về JSON cấu trúc:
         model: geminiModel,
         data: parsedResult,
         attempts: attemptCount,
+        requestId,
+        durationMs: totalElapsedMs,
         usage: geminiData?.usageMetadata || null
       }),
       {
@@ -697,11 +787,13 @@ Trả về JSON cấu trúc:
     );
 
   } catch (error: any) {
+    console.error(`[${requestId}] [UNCAUGHT_EXCEPTION]`, error);
     return new Response(
       JSON.stringify({
         success: false,
         error: error?.message || "Đã xảy ra sự cố không xác định trên Supabase Edge Function.",
-        code: "INTERNAL_ERROR"
+        code: "INTERNAL_ERROR",
+        requestId
       }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
@@ -716,43 +808,29 @@ Trả về JSON cấu trúc:
 1. **Kiểm tra trực tiếp từ giao diện Supabase Dashboard**:
    - Trong màn hình Function `generate-content`, chọn tab **Invocations** hoặc **Logs**.
    - Kiểm tra xem function có đang ở trạng thái **Healthy / Active** hay không.
+   - Quan sát các log có định dạng `[req_xxx] [CALL_START]`, `[req_xxx] [CALL_RESP]` để theo dõi thời gian thực thi thực tế.
 
 2. **Thử nghiệm trên ứng dụng AI Affiliate Command Center**:
    - Mở ứng dụng trong trình duyệt hoặc Safari trên iPhone.
    - Nhấn **"Đăng Nhập Quản Trị"** và đăng nhập tài khoản Supabase của bạn.
    - Chuyển sang module **Content Factory (Xưởng Kịch Bản)**.
    - Nhấn **"Tạo Kịch Bản Mới"**, chọn sản phẩm và nhấn **"Bắt Đầu Gọi Gemini"**.
-   - Nếu gặp thời điểm Google quá tải (503), ứng dụng sẽ tự động thử lại 3 lần và hiển thị tiến trình: `"Gemini đang quá tải. Đang thử lại lần 2/3…"`.
+   - Quan sát bộ đếm thời gian: `"Gemini đang viết kịch bản... (Xs / tối đa 120s)"`.
+   - Nếu cần dừng lại, nhấn nút **"Dừng & Hủy"**.
    - Khi modal **"Xem Trước & Chỉnh Sửa Kịch Bản AI"** xuất hiện: kiểm tra câu Hook, các cảnh quay và lời thoại do Gemini sinh ra.
    - Nhấn **"Lưu Kịch Bản Vào Bản Nháp (Supabase)"** -> Kịch bản sẽ được lưu vào bảng `content_drafts`.
-   - Kiểm tra bảng `content_drafts` và `ai_task_logs` trong Supabase Table Editor để thấy bản ghi thực tế.
-
-3. **Thử nghiệm qua cURL (Terminal)**:
-   ```bash
-   curl -i --location --request POST 'https://<your-project-ref>.supabase.co/functions/v1/generate-content' \
-     --header 'Authorization: Bearer <your-supabase-user-jwt-token>' \
-     --header 'Content-Type: application/json' \
-     --data '{
-       "action": "analyze_product",
-       "payload": {
-         "productName": "Tai nghe Bluetooth chống ồn",
-         "category": "Công nghệ",
-         "priceVND": 350000,
-         "platform": "tiktok"
-       }
-     }'
-   ```
 
 ---
 
-## 6. Bảng Phân Loại & Xử Lý Mã Lỗi
+## 6. Bảng Phân Loại & Xử Lý Mã Lỗi Đã Đồng Bộ
 
-| Mã lỗi hiển thị | Phân loại trạng thái | Cơ chế Retry | Hướng dẫn khắc phục trên UI |
+| Mã lỗi hiển thị | Phân loại trạng thái | Ngân sách & Cơ chế Retry | Hướng dẫn khắc phục trên UI |
 | :--- | :--- | :--- | :--- |
-| **HTTP 503** (`SERVICE_UNAVAILABLE`) | Gemini đang quá tải tạm thời (High demand) | Tự động thử lại tối đa 3 lần với Exponential Backoff | Hiển thị: *"Gemini hiện đang quá tải. Vui lòng thử lại sau ít phút."* (Tuyệt đối KHÔNG hiển thị kiểm tra API Key). |
-| **HTTP 429** (`RATE_LIMIT_EXCEEDED`) | Vượt hạn mức hoặc tốc độ yêu cầu (Rate Limit) | Tự động thử lại sau khoảng nghỉ | Hiển thị: *"Hạn mức Gemini API đã chạm giới hạn (429 Rate Limit). Thử lại sau ít phút hoặc nâng hạn mức quota."* |
-| **HTTP 504** (`TIMEOUT`) | Hết thời gian chờ phản hồi (30s) | Tự động thử lại | Hiển thị: *"Hết thời gian chờ phản hồi từ máy chủ AI. Vui lòng bấm thử lại."* |
-| **HTTP 500 / 502** (`SERVER_ERROR`) | Lỗi máy chủ tạm thời từ Google | Tự động thử lại | Hiển thị: *"Lỗi máy chủ tạm thời từ dịch vụ Google Gemini. Vui lòng thử lại sau ít phút."* |
+| **HTTP 503** (`SERVICE_UNAVAILABLE`) | Gemini đang quá tải tạm thời (High demand) | Tự động thử lại 1 lần nếu còn $\ge 40$s | Hiển thị: *"Gemini hiện đang quá tải. Vui lòng thử lại sau ít phút."* (Tuyệt đối KHÔNG hiển thị kiểm tra API Key). |
+| **HTTP 429** (`RATE_LIMIT_EXCEEDED`) | Vượt hạn mức hoặc tốc độ yêu cầu (Rate Limit) | Tự động thử lại sau khoảng nghỉ nếu còn thời gian | Hiển thị: *"Hạn mức Gemini API đã chạm giới hạn (429 Rate Limit). Thử lại sau ít phút hoặc nâng hạn mức quota."* |
+| **HTTP 504** (`TIMEOUT`) | Quá thời gian xử lý AI ($>120$s) | Ngắt an toàn trước gateway 150s | Hiển thị: *"Hết thời gian chờ phản hồi từ máy chủ AI (504 Timeout). Gemini đang xử lý chậm hơn bình thường. Vui lòng thử lại hoặc chọn thời lượng 20s - 30s."* |
+| **HTTP 499** (`ABORTED`) | Người dùng chủ động hủy yêu cầu | Dừng ngay lập tức, không retry, không log lỗi | Hiển thị thông báo: *"Đã dừng yêu cầu tạo kịch bản theo yêu cầu của bạn."* |
+| **HTTP 500 / 502** (`SERVER_ERROR`) | Lỗi máy chủ tạm thời từ Google | Tự động thử lại nếu còn thời gian | Hiển thị: *"Lỗi máy chủ tạm thời từ dịch vụ Google Gemini. Vui lòng thử lại sau ít phút."* |
 | **HTTP 401** (`UNAUTHORIZED`) | Phiên đăng nhập không hợp lệ hoặc hết hạn | **Không retry** (lỗi vĩnh viễn) | Hiển thị: *"Phiên làm việc đã hết hạn. Vui lòng nhấn 'Đăng Nhập Quản Trị' để đăng nhập lại."* |
 | **HTTP 403** (`API_KEY_INVALID`) | Khóa API Key hoặc quyền truy cập không hợp lệ | **Không retry** (lỗi vĩnh viễn) | Hiển thị: *"Khóa GEMINI_API_KEY hoặc quyền truy cập không hợp lệ. Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets."* |
 | **HTTP 404** (`FUNCTION_NOT_FOUND`) | Edge Function chưa được deploy trên Supabase | **Không retry** | Hiển thị: *"Edge Function chưa được deploy trên Supabase. Vui lòng xem hướng dẫn triển khai."* |

@@ -55,6 +55,8 @@ export interface EdgeFunctionResult<T> {
   details?: string;
   hint?: string;
   attempts?: number;
+  requestId?: string;
+  durationMs?: number;
 }
 
 export interface InvokeOptions {
@@ -64,8 +66,8 @@ export interface InvokeOptions {
 export const edgeFunctionService = {
   /**
    * Gọi Supabase Edge Function 'generate-content'
-   * Lưu ý: Cơ chế retry transient error (503, 502, 500, 429) với Exponential Backoff & Jitter
-   * được xử lý trực tiếp tại backend Edge Function để tránh lãng phí thời gian và xung đột timeout.
+   * Đồng bộ deadline: 125s watchdog ở client (cho phép backend 120s hoàn thành hoặc trả mã 504)
+   * Backend là nơi duy nhất quản lý retry transient errors.
    */
   async invokeFunction<T>(
     action: 'generate_script' | 'analyze_product' | 'trend_ideas' | 'audit_content' | 'generate_title_description',
@@ -102,21 +104,40 @@ export const edgeFunctionService = {
       };
     }
 
-    // 2. Kiểm tra nếu người dùng đã hủy (AbortSignal)
+    // 2. Kiểm tra nếu người dùng đã hủy trước khi bắt đầu
     if (options?.signal?.aborted) {
       return {
         success: false,
         data: null,
-        error: 'Yêu cầu đã bị hủy.',
+        error: 'Yêu cầu đã bị hủy bởi người dùng.',
         code: 'ABORTED'
       };
     }
 
+    // 3. Tạo client-side watchdog 125s đồng bộ với 120s backend deadline
+    const watchdogController = new AbortController();
+    const watchdogTimeoutId = setTimeout(() => {
+      watchdogController.abort(new DOMException('Client watchdog timeout (125s)', 'TimeoutError'));
+    }, 125000);
+
+    const onUserAbort = () => {
+      watchdogController.abort(new DOMException('User aborted request', 'AbortError'));
+    };
+    if (options?.signal) {
+      options.signal.addEventListener('abort', onUserAbort, { once: true });
+    }
+
     try {
-      // 3. Gửi request duy nhất tới Edge Function (Backend tự quản lý retry 3 lần)
-      const { data, error } = await client.functions.invoke('generate-content', {
-        body: { action, payload }
+      // 4. Gửi request duy nhất tới Edge Function với signal kết hợp
+      const { data, error } = await (client.functions.invoke as any)('generate-content', {
+        body: { action, payload },
+        signal: watchdogController.signal
       });
+
+      clearTimeout(watchdogTimeoutId);
+      if (options?.signal) {
+        options.signal.removeEventListener('abort', onUserAbort);
+      }
 
       // Xử lý khi có lỗi HTTP từ Edge Function
       if (error) {
@@ -139,6 +160,21 @@ export const edgeFunctionService = {
         let resolvedError = errorBody?.error;
         let resolvedHint = errorBody?.hint;
         let resolvedDetails = errorBody?.details || rawMsg;
+        const requestId = errorBody?.requestId;
+        const attempts = errorBody?.attempts || 1;
+        const durationMs = errorBody?.durationMs;
+
+        // Xử lý hủy do người dùng
+        if (options?.signal?.aborted || resolvedCode === 'ABORTED' || rawMsg.includes('aborted')) {
+          return {
+            success: false,
+            data: null,
+            error: 'Yêu cầu đã bị hủy bởi người dùng.',
+            code: 'ABORTED',
+            requestId,
+            durationMs
+          };
+        }
 
         // 404: Function chưa deploy
         if (rawMsg.includes('404') || rawMsg.includes('Failed to send a request') || rawMsg.includes('FunctionsFetchError')) {
@@ -173,8 +209,8 @@ export const edgeFunctionService = {
         // 504: Timeout
         else if (rawMsg.includes('504') || resolvedCode === 'TIMEOUT') {
           resolvedCode = 'TIMEOUT';
-          resolvedError = 'Hết thời gian chờ phản hồi từ máy chủ AI (504 Timeout). Vui lòng thử lại.';
-          resolvedHint = 'Kết nối mạng tới máy chủ AI quá hạn.';
+          resolvedError = resolvedError || 'Hết thời gian chờ phản hồi từ máy chủ AI (504 Timeout). Vui lòng thử lại.';
+          resolvedHint = 'Gemini cần thời gian để tạo kịch bản hoàn chỉnh (thường mất 20-45 giây). Máy chủ đang xử lý chậm hơn bình thường.';
         }
         // 500 / 502: Server Error
         else if (rawMsg.includes('502') || rawMsg.includes('500') || resolvedCode === 'SERVER_ERROR' || resolvedCode === 'BAD_GATEWAY') {
@@ -190,7 +226,9 @@ export const edgeFunctionService = {
           code: resolvedCode || 'FUNCTION_ERROR',
           details: resolvedDetails,
           hint: resolvedHint,
-          attempts: 1
+          attempts,
+          requestId,
+          durationMs
         };
       }
 
@@ -204,6 +242,8 @@ export const edgeFunctionService = {
           resolvedHint = 'Máy chủ AI của Google đang có lượng truy cập cao đột biến. Hãy thử lại sau ít phút.';
         } else if (resolvedCode === 'API_KEY_INVALID' || resolvedCode === 'MISSING_GEMINI_KEY') {
           resolvedHint = 'Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets.';
+        } else if (resolvedCode === 'TIMEOUT') {
+          resolvedHint = 'Gemini cần thời gian để hoàn thành kịch bản. Vui lòng thử lại hoặc giảm thời lượng.';
         }
 
         return {
@@ -213,7 +253,9 @@ export const edgeFunctionService = {
           code: resolvedCode,
           details: data.details,
           hint: resolvedHint,
-          attempts: data.attempts || 1
+          attempts: data.attempts || 1,
+          requestId: data.requestId,
+          durationMs: data.durationMs
         };
       }
 
@@ -224,6 +266,8 @@ export const edgeFunctionService = {
           data: data.data as T,
           model: data.model,
           attempts: data.attempts || 1,
+          requestId: data.requestId,
+          durationMs: data.durationMs,
           error: null
         };
       }
@@ -237,7 +281,32 @@ export const edgeFunctionService = {
         attempts: 1
       };
     } catch (err: any) {
-      // Lỗi ngoại lệ mạng (Network Exception)
+      clearTimeout(watchdogTimeoutId);
+      if (options?.signal) {
+        options.signal.removeEventListener('abort', onUserAbort);
+      }
+
+      // Kiểm tra nếu là do người dùng hủy
+      if (options?.signal?.aborted || err?.name === 'AbortError' && options?.signal?.aborted) {
+        return {
+          success: false,
+          data: null,
+          error: 'Yêu cầu đã bị hủy bởi người dùng.',
+          code: 'ABORTED'
+        };
+      }
+
+      // Kiểm tra nếu là client watchdog timeout
+      if (err?.name === 'TimeoutError' || err?.message?.includes('watchdog timeout')) {
+        return {
+          success: false,
+          data: null,
+          error: 'Hết thời gian chờ phản hồi từ máy chủ AI (504 Timeout). Vui lòng thử lại.',
+          code: 'TIMEOUT',
+          hint: 'Quá trình xử lý vượt quá 120 giây. Vui lòng kiểm tra lại kết nối mạng hoặc thử lại sau ít phút.'
+        };
+      }
+
       const errMsg = err?.message || String(err);
       return {
         success: false,

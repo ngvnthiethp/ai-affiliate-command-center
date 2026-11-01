@@ -82,6 +82,17 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [generationError, setGenerationError] = useState<{ message: string; hint?: string; details?: string } | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+  const abortControllerRef = React.useRef<AbortController | null>(null);
+
+  // Dọn dẹp request khi component unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   // Sync selectedProductForScript when incoming prop changes
   useEffect(() => {
@@ -101,6 +112,19 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
 
   // Find currently selected product in the form
   const currentSelectedProduct = products.find((p) => p.id === targetProductId) || products[0];
+
+  // Hủy tiến trình AI do người dùng bấm nút
+  const handleCancelGeneration = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsGenerating(false);
+    setElapsedSeconds(0);
+    if (addToast) {
+      addToast('Đã dừng yêu cầu tạo kịch bản theo yêu cầu của bạn.', 'info');
+    }
+  };
 
   // Handle Generate with Supabase Edge Function & Gemini
   const handleGenerateSubmit = async (e: React.FormEvent) => {
@@ -124,19 +148,42 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
     }
 
     setIsGenerating(true);
+    setElapsedSeconds(0);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const timer = setInterval(() => {
+      setElapsedSeconds((prev) => prev + 1);
+    }, 1000);
 
     try {
-      const res = await edgeFunctionService.generateScript({
-        productName: currentSelectedProduct.name,
-        category: currentSelectedProduct.category,
-        platform: currentSelectedProduct.platform,
-        priceVND: currentSelectedProduct.priceVND,
-        commissionRate: currentSelectedProduct.commissionRate,
-        targetAudience: targetAudience.trim() || undefined,
-        tone: selectedTone,
-        targetDuration,
-        keyFeatures: keyFeatures.trim() || undefined
-      });
+      const res = await edgeFunctionService.generateScript(
+        {
+          productName: currentSelectedProduct.name,
+          category: currentSelectedProduct.category,
+          platform: currentSelectedProduct.platform,
+          priceVND: currentSelectedProduct.priceVND,
+          commissionRate: currentSelectedProduct.commissionRate,
+          targetAudience: targetAudience.trim() || undefined,
+          tone: selectedTone,
+          targetDuration,
+          keyFeatures: keyFeatures.trim() || undefined
+        },
+        {
+          signal: controller.signal
+        }
+      );
+
+      clearInterval(timer);
+      abortControllerRef.current = null;
+
+      // Nếu người dùng đã hủy
+      if (res.code === 'ABORTED' || controller.signal.aborted) {
+        setIsGenerating(false);
+        setElapsedSeconds(0);
+        return;
+      }
 
       if (!res.success || !res.data) {
         // Classify error exactly per specification
@@ -150,7 +197,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
         if (isOverloaded) {
           hint = 'Máy chủ AI của Google đang có lượng truy cập đột biến tạm thời (Spikes in demand). Hãy thử lại sau ít phút.';
         } else if (res.code === 'TIMEOUT' || res.code === '504') {
-          hint = 'Hết thời gian chờ phản hồi từ máy chủ AI. Vui lòng bấm thử lại.';
+          hint = 'Gemini cần thời gian hoàn thành kịch bản video (thường 20-45 giây). Máy chủ đang phản hồi chậm hoặc mạng chập chờn. Vui lòng bấm thử lại hoặc chọn thời lượng 20s - 30s.';
         } else if (res.code === 'RATE_LIMIT_EXCEEDED' || res.code === '429') {
           hint = 'Hạn mức Gemini API đã chạm giới hạn (429 Rate Limit). Thử lại sau ít phút hoặc nâng hạn mức quota.';
         } else if (res.code === 'FUNCTION_NOT_FOUND') {
@@ -173,7 +220,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
           hint: hint
         });
 
-        // Ghi log đúng MỘT LẦN vào bảng ai_task_logs khi kết thúc thất bại
+        // Ghi log đúng MỘT LẦN vào bảng ai_task_logs khi kết thúc thất bại thật
         await aiLogService.logAITask({
           level: 'error',
           source: 'Copywriter AI',
@@ -181,6 +228,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
         });
 
         setIsGenerating(false);
+        setElapsedSeconds(0);
         return;
       }
 
@@ -194,6 +242,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
           hint: 'Vui lòng thử tạo lại kịch bản.'
         });
         setIsGenerating(false);
+        setElapsedSeconds(0);
         return;
       }
 
@@ -867,19 +916,56 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
               </div>
             )}
 
+            {/* Live generating status banner */}
+            {isGenerating && (
+              <div className="p-3 rounded-xl bg-[#080d16] border border-cyan-500/40 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 font-bold text-cyan-300">
+                    <RefreshCw className="w-3.5 h-3.5 text-cyan-400 animate-spin" />
+                    <span>Gemini đang viết kịch bản... ({elapsedSeconds}s / tối đa 120s)</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCancelGeneration}
+                    className="px-2 py-0.5 rounded-md bg-red-950/80 text-red-300 hover:bg-red-900 border border-red-800 text-[11px] font-semibold transition-colors"
+                  >
+                    Dừng & Hủy
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-relaxed">
+                  Đang phân tích dữ liệu deal, xây dựng 2 Hook A/B và chi tiết từng cảnh quay. Quá trình xử lý thường mất từ 20 đến 45 giây.
+                </p>
+                <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="bg-gradient-to-r from-cyan-400 via-purple-500 to-cyan-300 h-full transition-all duration-1000"
+                    style={{ width: `${Math.min(100, Math.max(5, Math.round((elapsedSeconds / 60) * 100)))}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
-              <button
-                type="button"
-                disabled={isGenerating}
-                onClick={() => {
-                  setIsGenerateModalOpen(false);
-                  onClearSelectedProduct();
-                  setGenerationError(null);
-                }}
-                className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium disabled:opacity-40"
-              >
-                Hủy
-              </button>
+              {isGenerating ? (
+                <button
+                  type="button"
+                  onClick={handleCancelGeneration}
+                  className="px-3 py-1.5 rounded-lg bg-red-950 hover:bg-red-900 text-red-200 border border-red-800 text-xs font-medium transition-colors"
+                >
+                  Hủy Yêu Cầu
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsGenerateModalOpen(false);
+                    onClearSelectedProduct();
+                    setGenerationError(null);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium"
+                >
+                  Đóng
+                </button>
+              )}
               <button
                 type="submit"
                 disabled={isGenerating || products.length === 0}
@@ -888,7 +974,7 @@ export const ContentFactoryModule: React.FC<ContentFactoryModuleProps> = ({
                 {isGenerating ? (
                   <>
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Gemini đang viết kịch bản...</span>
+                    <span>Đang xử lý ({elapsedSeconds}s)...</span>
                   </>
                 ) : (
                   <>
