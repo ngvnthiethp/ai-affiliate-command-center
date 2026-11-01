@@ -1,0 +1,8 @@
+{
+  "name": "AI Affiliate Command Center",
+  "description": "Trung tâm chỉ huy Affiliate Marketing tự động hóa 24/7 cho thị trường Việt Nam (TikTok Shop & Shopee)",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
