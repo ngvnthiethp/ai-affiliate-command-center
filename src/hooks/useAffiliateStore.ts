@@ -348,12 +348,21 @@ export function useAffiliateStore() {
 
     if (!skipSecondaryLog) {
       addToast(`Thử nghiệm thành công! Đã tiêu thụ ${addedTokens.toLocaleString()} token.`, 'success');
+      let sourceName: SystemLog['source'] = 'Hệ thống';
+      if (target.name.includes('ChatGPT')) sourceName = 'ChatGPT';
+      else if (target.name.includes('Gemini')) sourceName = 'Gemini';
+      else if (target.name.includes('Grok')) sourceName = 'Grok';
+      else if (target.name.includes('Claude')) sourceName = 'Claude';
+      else if (target.name.includes('DeepSeek')) sourceName = 'DeepSeek';
+      else if (target.name.includes('Scout')) sourceName = 'Scout AI';
+      else if (target.name.includes('Copywriter')) sourceName = 'Copywriter AI';
+      else if (target.name.includes('Visual')) sourceName = 'Visual AI';
+      else if (target.name.includes('Ads')) sourceName = 'Ads AI';
+      else if (target.name.includes('Auditor')) sourceName = 'Auditor AI';
+
       addSystemLog(
         'success',
-        target.name.includes('Scout') ? 'Scout AI' :
-        target.name.includes('Copywriter') ? 'Copywriter AI' :
-        target.name.includes('Visual') ? 'Visual AI' :
-        target.name.includes('Ads') ? 'Ads AI' : 'Auditor AI',
+        sourceName,
         `Chạy thử nghiệm hoàn tất. Tiêu tốn ${addedTokens} tokens.`
       );
     }

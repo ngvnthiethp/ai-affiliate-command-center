@@ -33,24 +33,69 @@ export interface PlatformShare {
   color: string;
 }
 
-export type AIAgentId = 'scout' | 'copywriter' | 'visual' | 'ads' | 'auditor';
+export type AIProviderId = 'gemini' | 'deepseek' | 'openai' | 'grok' | 'claude';
+
+export type AIConnectionStatus = 'CONNECTED' | 'NOT_CONFIGURED' | 'ERROR';
+
+export type AIAgentId = 
+  | 'chatgpt' 
+  | 'gemini' 
+  | 'grok' 
+  | 'claude' 
+  | 'deepseek'
+  // Backward compatibility aliases
+  | 'scout' 
+  | 'copywriter' 
+  | 'visual' 
+  | 'ads' 
+  | 'auditor';
 
 export interface AIAgent {
   id: AIAgentId;
   name: string;
   codeName: string;
   role: string;
+  tasks?: string[];
   description: string;
-  model: 'Gemini 2.5 Flash' | 'DeepSeek V3' | 'Claude 3.5 Sonnet';
+  provider?: string;
+  providerId?: AIProviderId;
+  model: string;
+  connectionStatus?: AIConnectionStatus;
   status: 'active' | 'idle' | 'paused' | 'error';
   tokenUsedToday: number;
   tokenLimit: number;
   tasksCompleted: number;
+  estimatedCostVND?: number;
   systemPrompt: string;
   lastActive: string;
   avatarIcon: string;
   colorAccent: string;
   logSummary: string;
+}
+
+export interface AgentStatusReport {
+  agentId?: string;
+  agentName?: string;
+  providerId: AIProviderId;
+  providerName: string;
+  configured: boolean;
+  status: AIConnectionStatus;
+  activeModel?: string;
+  model?: string;
+  role?: string;
+  isPrimary?: boolean;
+  isBackup?: boolean;
+  latencyMs?: number;
+  message?: string;
+}
+
+export interface CostQuotaStatus {
+  dailyTaskCount: number;
+  dailyTaskLimit: number;
+  monthlySpentVND: number;
+  monthlyBudgetVND: number;
+  isDailyQuotaExceeded: boolean;
+  isMonthlyBudgetExceeded: boolean;
 }
 
 export type PlatformType = 'tiktok' | 'shopee' | 'lazada';
@@ -139,7 +184,7 @@ export interface SystemLog {
   id: string;
   timestamp: string;
   level: 'info' | 'success' | 'warn' | 'error';
-  source: 'Hệ thống' | 'Scout AI' | 'Copywriter AI' | 'Visual AI' | 'Ads AI' | 'Auditor AI';
+  source: 'Hệ thống' | 'ChatGPT' | 'Gemini' | 'Grok' | 'Claude' | 'DeepSeek' | 'Scout AI' | 'Copywriter AI' | 'Visual AI' | 'Ads AI' | 'Auditor AI';
   message: string;
   isDemo?: boolean;
 }

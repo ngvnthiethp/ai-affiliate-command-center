@@ -1,5 +1,5 @@
 import { getSupabaseClient, isSupabaseConfigured } from '../lib/supabase';
-import { ContentScript } from '../types';
+import { ContentScript, AgentStatusReport, CostQuotaStatus, AIAgentId } from '../types';
 
 export interface AIScriptOutput {
   title: string;
@@ -50,6 +50,16 @@ export interface EdgeFunctionResult<T> {
   success: boolean;
   data: T | null;
   model?: string;
+  provider?: string;
+  requestedAgent?: string;
+  executedAgent?: string;
+  fallbackReason?: string | null;
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
+  estimatedCostVND?: number;
   error?: string | null;
   code?: string;
   details?: string;
@@ -57,6 +67,8 @@ export interface EdgeFunctionResult<T> {
   attempts?: number;
   requestId?: string;
   durationMs?: number;
+  quota?: CostQuotaStatus;
+  agents?: AgentStatusReport[];
 }
 
 export interface InvokeOptions {
@@ -70,7 +82,15 @@ export const edgeFunctionService = {
    * Backend là nơi duy nhất quản lý retry transient errors.
    */
   async invokeFunction<T>(
-    action: 'generate_script' | 'analyze_product' | 'trend_ideas' | 'audit_content' | 'generate_title_description',
+    action: 
+      | 'check_agents_status'
+      | 'orchestrate_task'
+      | 'generate_script' 
+      | 'analyze_product' 
+      | 'trend_ideas' 
+      | 'audit_content' 
+      | 'generate_title_description'
+      | string,
     payload: Record<string, any>,
     options?: InvokeOptions
   ): Promise<EdgeFunctionResult<T>> {
@@ -129,8 +149,13 @@ export const edgeFunctionService = {
 
     try {
       // 4. Gửi request duy nhất tới Edge Function với signal kết hợp
+      const requestBody: any = { action, ...payload };
+      if (payload && !payload.payload && (action === 'generate_script' || action === 'analyze_product' || action === 'trend_ideas' || action === 'audit_content' || action === 'generate_title_description')) {
+        requestBody.payload = payload;
+      }
+
       const { data, error } = await (client.functions.invoke as any)('generate-content', {
-        body: { action, payload },
+        body: requestBody,
         signal: watchdogController.signal
       });
 
@@ -260,11 +285,19 @@ export const edgeFunctionService = {
       }
 
       // Thành công: Trả về kết quả
-      if (data && data.success && data.data) {
+      if (data && data.success) {
         return {
           success: true,
-          data: data.data as T,
+          data: (data.data !== undefined ? data.data : data) as T,
           model: data.model,
+          provider: data.provider,
+          requestedAgent: data.requestedAgent,
+          executedAgent: data.executedAgent,
+          fallbackReason: data.fallbackReason,
+          usage: data.usage,
+          estimatedCostVND: data.estimatedCostVND,
+          quota: data.quota,
+          agents: data.agents,
           attempts: data.attempts || 1,
           requestId: data.requestId,
           durationMs: data.durationMs,
@@ -391,5 +424,35 @@ export const edgeFunctionService = {
     options?: InvokeOptions
   ): Promise<EdgeFunctionResult<{ titles: string[]; description: string; hashtags: string[] }>> {
     return this.invokeFunction<{ titles: string[]; description: string; hashtags: string[] }>('generate_title_description', params, options);
+  },
+
+  /**
+   * Phase 3: Kiểm tra trạng thái kết nối thật của 5 AI Agents và Quota hệ thống từ Edge Function
+   */
+  async checkAgentsStatus(
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<{ agents: AgentStatusReport[]; quota: CostQuotaStatus }>> {
+    return this.invokeFunction<{ agents: AgentStatusReport[]; quota: CostQuotaStatus }>('check_agents_status', {}, options);
+  },
+
+  /**
+   * Phase 3: AI Brain Task Orchestrator điều phối đa Agent, Router và Fallback thông minh
+   */
+  async orchestrateTask(
+    params: {
+      taskType: 
+        | 'operations_strategy' 
+        | 'market_research' 
+        | 'content_creation' 
+        | 'trend_intelligence' 
+        | 'content_compliance' 
+        | 'technical_analysis';
+      preferredAgent?: AIAgentId;
+      inputPrompt?: string;
+      payload?: Record<string, any>;
+    },
+    options?: InvokeOptions
+  ): Promise<EdgeFunctionResult<any>> {
+    return this.invokeFunction<any>('orchestrate_task', params, options);
   }
 };

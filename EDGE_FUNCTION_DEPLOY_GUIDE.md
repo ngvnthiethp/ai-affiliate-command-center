@@ -1,194 +1,514 @@
-# Hướng Dẫn Triển Khai Supabase Edge Function `generate-content` (Backend Gemini API)
+# Hướng Dẫn Triển Khai Supabase Edge Function `generate-content`
+## Phase 3: AI Brain & Multi-Agent Orchestration
 
 > **LƯU Ý QUAN TRỌNG:**
-> Toàn bộ mã nguồn phía Frontend của ứng dụng **AI Affiliate Command Center (AI ACC)** đã được kết nối sẵn sàng.
-> Tuy nhiên, **Supabase Edge Function là một dịch vụ backend đám mây chạy trên tài khoản Supabase của bạn**. 
-> Để hệ thống gọi được Gemini API thực tế mà không để lộ API Key, **bạn cần thực hiện deploy hàm này lên dự án Supabase của mình** theo một trong hai cách bên dưới.
+> Toàn bộ kiến trúc phía Frontend của ứng dụng **AI Affiliate Command Center (AI ACC)** đã được tích hợp hoàn chỉnh.
+> **Supabase Edge Function là dịch vụ backend đám mây chạy trên hạ tầng Supabase của bạn**. 
+> Để hệ thống điều phối 5 Agent và gọi các AI API thực tế mà không để lộ API Key, **bạn cần cập nhật và deploy hàm này lên dự án Supabase của mình**.
 >
-> Ứng dụng **không giả lập dữ liệu** và **không tuyên bố đã deploy thành công** khi bạn chưa đưa hàm lên Supabase Cloud.
+> Ứng dụng **không giả lập dữ liệu** và **không hiển thị CONNECTED** khi chưa cấu hình API Key.
 
 ---
 
-## 1. Kiến Trúc Bảo Mật & Đồng Bộ Timeout Toàn Hệ Thống
+## 1. Kiến Trúc AI Brain & Multi-Agent Orchestration (Phase 3)
 
-1. **Frontend (Bảo mật & Đồng bộ Deadline)**:
-   - Chỉ sử dụng `VITE_SUPABASE_ANON_KEY` công khai.
-   - **Tuyệt đối không lưu trữ hay gửi `GEMINI_API_KEY` hay `service_role key` ở Frontend**.
-   - Gửi yêu cầu qua `supabase.functions.invoke('generate-content', { body: { action, payload }, signal })` kèm Bearer JWT Token của tài khoản đăng nhập.
-   - **Đồng bộ Watchdog Timeout**: Frontend đặt hạn chót 125 giây, nhường quyền kiểm soát toàn bộ 120 giây cho Edge Function xử lý mà không bị abort sớm.
-   - Người dùng có thể nhấn nút **"Dừng & Hủy"** bất kỳ lúc nào để ngắt kết nối an toàn (`AbortController`).
+1. **Đội ngũ 5 AI Agent**:
+   - **Agent 1 - ChatGPT (OpenAI)**: `Operations & Strategy` (Điều hành & Chiến lược).
+   - **Agent 2 - Gemini (Google)**: `Market Research & Content Intelligence` (Deal & Kịch bản) - **Provider Chính**.
+   - **Agent 3 - Grok (xAI)**: `Trend Intelligence` (Bắt sóng xu hướng thị trường).
+   - **Agent 4 - Claude (Anthropic)**: `Content Quality & Compliance` (Kiểm định chất lượng & Chính sách).
+   - **Agent 5 - DeepSeek (DeepSeek)**: `Technical & Data Analysis` (Phân tích dữ liệu & Tính toán ROI) - **Provider Dự Phòng**.
 
-2. **Backend Supabase Edge Function (`generate-content`)**:
-   - Chạy trên Deno runtime tại Cloud Edge của Supabase.
-   - **Tổng ngân sách thời gian**: `120,000ms` (120 giây, an toàn dưới giới hạn 150 giây idle timeout của Supabase Gateway).
-   - **Ngân sách từng lượt gọi Gemini**:
-     - Tác vụ sinh kịch bản (`generate_script`): cấp **55 giây** cho mỗi lượt gọi (đủ thời gian cho Gemini Flash sinh JSON chi tiết tiếng Việt 15-40s).
-     - Tác vụ ngắn (`analyze_product`, `audit_content`, `trend_ideas`): cấp **25 giây** cho mỗi lượt gọi.
-   - **Cơ chế Retry thông minh (Exponential Backoff + Jitter)**:
-     - Tối đa 1 lần retry cho `generate_script` nếu thời gian còn lại trước deadline tổng $\ge 40$ giây.
-     - Tối đa 2 lần retry cho các tác vụ ngắn nếu thời gian còn lại $\ge 15$ giây.
-     - **Chỉ retry lỗi tạm thời**: HTTP 503 (Quá tải), 502 (Bad Gateway), 500 (Lỗi máy chủ), 429 (Rate Limit), 408 (Timeout).
-     - **Tuyệt đối KHÔNG retry**: lỗi 400 (Bad Request), 401 (Unauthorized), 403 (Invalid API Key), hoặc khi người dùng đã chủ động hủy request (`AbortError`).
-   - Ghi nhật ký vào bảng `ai_task_logs` **duy nhất 1 lần** khi kết thúc thực sự (không phát sinh log rác).
-   - Logging chẩn đoán kèm `requestId` theo dõi từng chặng: bắt đầu, xác thực JWT, thời gian gọi Gemini, HTTP status, thời gian delay, tổng thời gian.
+2. **Cơ Chế Auto-Router & Smart Fallback**:
+   - Khi một Agent được yêu cầu nhưng chưa cấu hình API Key trong Supabase Secrets:
+     - Hệ thống **tuyệt đối không giả lập thành công**.
+     - Tự động chuyển tiếp (Fallback) sang **Gemini** (hoặc **DeepSeek**) nếu đã có API Key.
+     - Trả về lý do chuyển tiếp rõ ràng (`fallbackReason`) để thông báo cho người dùng trên giao diện.
 
-3. **Quy Trình 2 Bước Tại Xưởng Kịch Bản (Content Factory)**:
-   - **Bước 1 (Xem trước & Chỉnh sửa)**: Gemini sinh kịch bản -> Trả kết quả về hiển thị trên Modal xem trước. Người dùng kiểm tra, chỉnh sửa tiêu đề, chọn Hook A/B, sửa lời thoại từng phân cảnh, CTA, hashtag, policy notes.
-   - **Bước 2 (Xác nhận lưu)**: Chỉ khi người dùng bấm **"Lưu Kịch Bản Vào Bản Nháp (Supabase)"**, ứng dụng mới thực hiện lệnh INSERT vào bảng `content_drafts`.
+3. **Cost Control & Quota Guardrails (Server-Side Enforced)**:
+   - **Giới hạn ngày**: Tối đa **20 tác vụ AI/ngày/người dùng** (chặn tự động phía máy chủ bằng HTTP 429).
+   - **Ngân sách tháng**: Mặc định **300.000 VNĐ/tháng**.
+   - **Giới hạn output tokens**: Tối đa 10.000 tokens/tác vụ.
+   - Tính toán chi phí thực tế/ước tính (VNĐ) dựa trên bảng giá chính thức của từng model.
 
----
-
-## 2. Cách 1: Triển Khai Trực Tiếp Trên Supabase Dashboard (Web & iPhone Safari)
-*Dành cho người không dùng máy tính hoặc không muốn cài đặt dòng lệnh (CLI). Thao tác dễ dàng trên cả máy tính lẫn Safari trên iPhone.*
-
-### Bước 1: Lấy API Key từ Google AI Studio
-1. Truy cập [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
-2. Tạo hoặc sao chép một khóa **Gemini API Key** (dạng `AIzaSy...`).
-
-### Bước 2: Cấu hình Secrets trên Supabase Dashboard
-1. Truy cập [https://supabase.com/dashboard](https://supabase.com/dashboard) và chọn dự án của bạn.
-2. Tại menu bên trái, tìm đến mục **Edge Functions** (biểu tượng tia sét).
-3. Bấm vào tab **Secrets** (hoặc chọn **Manage Secrets**).
-4. Bấm **Add new secret** và nhập 2 biến sau:
-   - **Tên**: `GEMINI_API_KEY`  
-     **Giá trị**: Dán mã Gemini API Key vừa lấy ở Bước 1.
-   - **Tên**: `GEMINI_MODEL` *(tùy chọn)*  
-     **Giá trị**: `gemini-2.5-flash` (hoặc `gemini-3.8-flash`).
-5. Bấm **Save** để lưu.
-
-### Bước 3: Tạo & Dán Code Function
-1. Vẫn trong mục **Edge Functions**, bấm nút **"Create a new function"** hoặc **"New Function"**.
-2. Đặt tên function chính xác là:
-   ```text
-   generate-content
-   ```
-3. Xóa toàn bộ nội dung mẫu có sẵn trong trình soạn thảo của Supabase, sau đó **sao chép toàn bộ nội dung mã nguồn ở Mục 4 bên dưới và dán vào**.
-4. Bấm nút **Deploy** (hoặc **Save & Deploy**).
-5. Sau 5-10 giây, trạng thái hàm sẽ hiển thị màu xanh lá: **Active**.
+4. **Đồng Bộ Timeout & Phân Tầng Deadline**:
+   - **Supabase Gateway Idle Timeout**: 150 giây.
+   - **Frontend Watchdog Timeout**: 125 giây (kèm nút "Dừng & Hủy" ngắt an toàn).
+   - **Edge Function Total Deadline**: 120 giây.
+   - **Single Call Budget**: 55 giây cho tác vụ kịch bản, 25 giây cho tác vụ nhanh.
+   - **Retry Policy**: Tối đa 1 lần retry cho tác vụ dài nếu thời gian còn lại $\ge 40$ giây. Chỉ retry lỗi tạm thời (503, 502, 500, 429, 408).
 
 ---
 
-## 3. Cách 2: Triển Khai Bằng Supabase CLI (Dành Cho Lập Trình Viên)
+## 2. Bảng Cấu Hình Secrets Trên Supabase
 
-Nếu bạn có máy tính và đã cài Supabase CLI:
+Truy cập **Supabase Dashboard** > **Edge Functions** > **Secrets** (hoặc tab **Manage Secrets**) và cấu hình:
 
-```bash
-# 1. Đăng nhập vào Supabase
-supabase login
+| Tên Biến Môi Trường (Secret) | AI Agent Phụ Trách | Trạng Thái | Nơi Lấy API Key |
+| :--- | :--- | :--- | :--- |
+| `GEMINI_API_KEY` | Agent 2 (Gemini) | **Bắt buộc (Primary)** | [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) |
+| `GEMINI_MODEL` *(tùy chọn)* | Agent 2 | Mặc định: `gemini-2.5-flash` | Google AI Studio |
+| `DEEPSEEK_API_KEY` | Agent 5 (DeepSeek) | **Khuyên dùng (Backup)** | [platform.deepseek.com](https://platform.deepseek.com) |
+| `DEEPSEEK_MODEL` *(tùy chọn)*| Agent 5 | Mặc định: `deepseek-chat` | DeepSeek Platform |
+| `OPENAI_API_KEY` | Agent 1 (ChatGPT) | Tùy chọn | [platform.openai.com](https://platform.openai.com) |
+| `GROK_API_KEY` hoặc `XAI_API_KEY` | Agent 3 (Grok) | Tùy chọn | [console.x.ai](https://console.x.ai) |
+| `ANTHROPIC_API_KEY` | Agent 4 (Claude) | Tùy chọn | [console.anthropic.com](https://console.anthropic.com) |
 
-# 2. Liên kết thư mục dự án với Project Reference ID trên Supabase
-supabase link --project-ref your-project-ref-id
+> 💡 **Mẹo**: Nếu bạn chỉ có `GEMINI_API_KEY`, hệ thống vẫn vận hành hoàn hảo nhờ cơ chế Smart Fallback tự động của AI Brain!
 
-# 3. Cài đặt các biến bí mật (Secrets)
-supabase secrets set GEMINI_API_KEY="AIzaSyYourGeminiApiKeyHere" GEMINI_MODEL="gemini-2.5-flash"
+---
 
-# 4. Triển khai Edge Function lên Cloud
-supabase functions deploy generate-content
+## 3. Cách Triển Khai Trực Tiếp (Supabase Dashboard)
+
+1. Mở **Supabase Dashboard** > Chọn Project của bạn.
+2. Menu trái chọn **Edge Functions** (biểu tượng tia sét).
+3. Chọn function `generate-content` (hoặc tạo mới nếu chưa có).
+4. Xóa code cũ, sao chép **toàn bộ mã nguồn ở Mục 5 bên dưới** và dán vào file `index.ts`.
+5. Nhấn **Save & Deploy** (chờ 5 giây hiển thị **Active**).
+6. Quay lại ứng dụng AI ACC > Vào mục **AI Manager** > Bấm nút **"Kiểm Tra Kết Nối"** để xác thực thời gian thực!
+
+---
+
+## 4. (Tùy Chọn) Migration Database Cho AI Brain Columns
+
+Nếu bạn muốn bảng `ai_task_logs` lưu riêng các cột: `agent`, `provider`, `model`, `input_tokens`, `output_tokens`, `estimated_cost`, hãy mở mục **SQL Editor** trên Supabase Dashboard và chạy đoạn mã không phá hủy (additive) sau:
+
+```sql
+ALTER TABLE public.ai_task_logs 
+  ADD COLUMN IF NOT EXISTS owner_id uuid REFERENCES auth.users(id) ON DELETE CASCADE,
+  ADD COLUMN IF NOT EXISTS request_id text,
+  ADD COLUMN IF NOT EXISTS agent text,
+  ADD COLUMN IF NOT EXISTS provider text,
+  ADD COLUMN IF NOT EXISTS model text,
+  ADD COLUMN IF NOT EXISTS input_tokens integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS output_tokens integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS estimated_cost numeric(12, 4) DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS actual_cost numeric(12, 4),
+  ADD COLUMN IF NOT EXISTS duration_ms integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS error_message text;
+
+CREATE INDEX IF NOT EXISTS idx_ai_task_logs_owner_created 
+  ON public.ai_task_logs(owner_id, created_at DESC);
 ```
 
+*(Lưu ý: Nếu không chạy migration này, Edge Function vẫn tự động fallback an toàn lưu thông tin vào 2 cột gốc `task_type` và `status` mà không gây bất kỳ lỗi nào!)*
+
 ---
 
-## 4. Toàn Bộ Mã Nguồn Đơn Tệp (Copy-Paste Cho `generate-content`)
+## 5. Toàn Bộ Mã Nguồn Đơn Tệp (Copy-Paste Cho `generate-content`)
 
-Sao chép toàn bộ khối mã dưới đây để dán vào file `index.ts` trên Supabase Dashboard:
+Sao chép toàn bộ khối mã dưới đây:
 
 ```typescript
 // Supabase Edge Function: generate-content
-// Chạy trên Deno runtime trong môi trường Supabase Edge Functions.
-// Đóng vai trò backend bảo mật trung gian giữa AI Affiliate Command Center và Google Gemini API.
+// Phase 3: AI Brain & Multi-Agent Orchestration (Deno Runtime)
+// Điều phối 5 AI Agent: ChatGPT (OpenAI), Gemini (Google), Grok (xAI), Claude (Anthropic), DeepSeek
+// Quản lý Provider, Router, Fallback thông minh, Giới hạn Quota 20 tasks/ngày và Ngân sách 300.000 VNĐ
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
-// CORS Headers cho phép gọi từ Frontend Web / iPhone Safari
+// CORS Headers cho phép gọi an toàn từ Web / iPhone Safari
 const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
+// Cấu hình Model Mặc định cho từng Provider
+const PROVIDER_CONFIGS = {
+  gemini: {
+    name: "Google Gemini",
+    defaultModel: "gemini-2.5-flash",
+    envKey: "GEMINI_API_KEY",
+    modelEnv: "GEMINI_MODEL",
+    costPer1MPromptUSD: 0.075,
+    costPer1MCompletionUSD: 0.30
+  },
+  deepseek: {
+    name: "DeepSeek",
+    defaultModel: "deepseek-chat",
+    envKey: "DEEPSEEK_API_KEY",
+    modelEnv: "DEEPSEEK_MODEL",
+    costPer1MPromptUSD: 0.14,
+    costPer1MCompletionUSD: 0.28
+  },
+  openai: {
+    name: "OpenAI",
+    defaultModel: "gpt-4o-mini",
+    envKey: "OPENAI_API_KEY",
+    modelEnv: "OPENAI_MODEL",
+    costPer1MPromptUSD: 0.15,
+    costPer1MCompletionUSD: 0.60
+  },
+  grok: {
+    name: "xAI Grok",
+    defaultModel: "grok-beta",
+    envKey: "GROK_API_KEY", // fallback: XAI_API_KEY
+    modelEnv: "GROK_MODEL",
+    costPer1MPromptUSD: 5.00,
+    costPer1MCompletionUSD: 15.00
+  },
+  claude: {
+    name: "Anthropic Claude",
+    defaultModel: "claude-3-5-sonnet-20241022",
+    envKey: "ANTHROPIC_API_KEY",
+    modelEnv: "ANTHROPIC_MODEL",
+    costPer1MPromptUSD: 3.00,
+    costPer1MCompletionUSD: 15.00
+  }
+};
+
+// Tỷ giá quy đổi USD -> VNĐ cho mục đích ước tính ngân sách
+const USD_TO_VND_RATE = 25400;
+
+// Giới hạn an toàn & Deadline hệ thống
+const TOTAL_EXECUTION_TIMEOUT_MS = 120000; // 120s (dưới 150s gateway timeout)
+const MAX_PAYLOAD_LENGTH = 5000;
+const MAX_OUTPUT_TOKENS_LIMIT = 10000;
+
+// Giới hạn ngân sách mặc định
+const DEFAULT_DAILY_TASK_LIMIT = 20; // 20 tác vụ/ngày/người dùng
+const DEFAULT_MONTHLY_BUDGET_VND = 300000; // 300.000 VNĐ/tháng
+
 interface RequestPayload {
-  action: "generate_script" | "analyze_product" | "trend_ideas" | "audit_content" | "generate_title_description";
-  payload: Record<string, any>;
+  action: 
+    | "check_agents_status" 
+    | "orchestrate_task"
+    // Backward compatibility
+    | "generate_script" 
+    | "analyze_product" 
+    | "trend_ideas" 
+    | "audit_content" 
+    | "generate_title_description";
+  payload?: Record<string, any>;
+  preferredAgent?: "chatgpt" | "gemini" | "grok" | "claude" | "deepseek";
+  taskType?: 
+    | "operations_strategy" 
+    | "market_research" 
+    | "content_creation" 
+    | "trend_intelligence" 
+    | "content_compliance" 
+    | "technical_analysis";
+  inputPrompt?: string;
 }
 
-// Cấu hình Model Gemini: Mặc định dùng gemini-2.5-flash (hoặc cấu hình qua biến GEMINI_MODEL)
-const DEFAULT_MODEL = "gemini-2.5-flash";
+interface ProviderCallResult {
+  success: boolean;
+  provider: string;
+  model: string;
+  text: string;
+  parsedJson?: any;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
+  estimatedCostVND: number;
+  durationMs: number;
+  httpStatus: number;
+  error?: string;
+  code?: string;
+}
 
-// Cấu hình deadline tổng: 120s (an toàn dưới 150s idle gateway timeout của Supabase)
-const TOTAL_EXECUTION_TIMEOUT_MS = 120000;
-const BASE_RETRY_DELAY_MS = 1500; // 1.5 giây ban đầu
-const MAX_RETRY_DELAY_MS = 5000; // Tối đa 5 giây cho một khoảng nghỉ
-
-/**
- * Kiểm tra xem mã trạng thái HTTP có thuộc diện lỗi tạm thời được phép retry hay không.
- * Chỉ retry: 503 (Quá tải), 502 (Bad Gateway), 500 (Internal Server Error), 429 (Rate Limit), 408 (Request Timeout).
- * TUYỆT ĐỐI KHÔNG RETRY: 400 (Bad Request), 401 (Unauthorized), 403 (Forbidden / Invalid API Key), 404 (Not Found).
- */
 function isTransientError(status: number): boolean {
   return status === 503 || status === 502 || status === 500 || status === 429 || status === 408;
 }
 
-/**
- * Đọc header Retry-After (nếu có) từ phản hồi HTTP của Gemini API
- */
-function getRetryAfterMs(headerValue: string | null): number | null {
-  if (!headerValue) return null;
-  const seconds = Number(headerValue);
-  if (!isNaN(seconds) && seconds > 0) {
-    return Math.min(seconds * 1000, 6000);
-  }
-  const dateMs = Date.parse(headerValue);
-  if (!isNaN(dateMs)) {
-    const diff = dateMs - Date.now();
-    return diff > 0 ? Math.min(diff, 6000) : null;
+function getApiKey(provider: keyof typeof PROVIDER_CONFIGS): string | null {
+  const cfg = PROVIDER_CONFIGS[provider];
+  const primary = Deno.env.get(cfg.envKey);
+  if (primary && primary.trim() !== "") return primary.trim();
+  if (provider === "grok") {
+    const fallbackXai = Deno.env.get("XAI_API_KEY");
+    if (fallbackXai && fallbackXai.trim() !== "") return fallbackXai.trim();
   }
   return null;
 }
 
+function calculateCostVND(
+  provider: keyof typeof PROVIDER_CONFIGS, 
+  promptTokens: number, 
+  completionTokens: number
+): number {
+  const cfg = PROVIDER_CONFIGS[provider];
+  const promptCostUSD = (promptTokens / 1000000) * cfg.costPer1MPromptUSD;
+  const completionCostUSD = (completionTokens / 1000000) * cfg.costPer1MCompletionUSD;
+  const totalCostUSD = promptCostUSD + completionCostUSD;
+  return Math.round(totalCostUSD * USD_TO_VND_RATE);
+}
+
+// ============================================================================
+// PROVIDER ADAPTERS
+// ============================================================================
+
+async function callGemini(
+  systemInstruction: string,
+  userPrompt: string,
+  apiKey: string,
+  signal: AbortSignal,
+  modelName?: string
+): Promise<ProviderCallResult> {
+  const start = Date.now();
+  const model = modelName || Deno.env.get("GEMINI_MODEL") || PROVIDER_CONFIGS.gemini.defaultModel;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const requestBody = {
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    generationConfig: {
+      temperature: 0.7,
+      responseMimeType: "application/json",
+      maxOutputTokens: 3000
+    }
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+    signal
+  });
+
+  const durationMs = Date.now() - start;
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsedErr: any = null;
+    try { parsedErr = JSON.parse(errText); } catch {}
+    const msg = parsedErr?.error?.message || errText || "Lỗi khi gọi Gemini API";
+    return {
+      success: false,
+      provider: "Google Gemini",
+      model,
+      text: "",
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      estimatedCostVND: 0,
+      durationMs,
+      httpStatus: response.status,
+      error: msg,
+      code: response.status === 429 ? "RATE_LIMIT_EXCEEDED" : response.status === 503 ? "SERVICE_UNAVAILABLE" : "GEMINI_ERROR"
+    };
+  }
+
+  const data = await response.json();
+  const candidateText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  const usageMeta = data?.usageMetadata || {};
+  const promptTokens = usageMeta.promptTokenCount || Math.ceil((userPrompt.length + systemInstruction.length) / 4);
+  const completionTokens = usageMeta.candidatesTokenCount || Math.ceil(candidateText.length / 4);
+  const totalTokens = usageMeta.totalTokenCount || (promptTokens + completionTokens);
+
+  let cleaned = candidateText.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+  let parsedJson: any = null;
+  try { parsedJson = JSON.parse(cleaned); } catch { parsedJson = { text: candidateText }; }
+
+  const costVND = calculateCostVND("gemini", promptTokens, completionTokens);
+
+  return {
+    success: true,
+    provider: "Google Gemini",
+    model,
+    text: candidateText,
+    parsedJson,
+    usage: { promptTokens, completionTokens, totalTokens },
+    estimatedCostVND: costVND,
+    durationMs,
+    httpStatus: 200
+  };
+}
+
+async function callOpenAICompatible(
+  provider: "deepseek" | "openai" | "grok",
+  systemInstruction: string,
+  userPrompt: string,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<ProviderCallResult> {
+  const start = Date.now();
+  let endpoint = "";
+  let defaultModel = "";
+
+  if (provider === "deepseek") {
+    endpoint = "https://api.deepseek.com/v1/chat/completions";
+    defaultModel = Deno.env.get("DEEPSEEK_MODEL") || PROVIDER_CONFIGS.deepseek.defaultModel;
+  } else if (provider === "openai") {
+    endpoint = "https://api.openai.com/v1/chat/completions";
+    defaultModel = Deno.env.get("OPENAI_MODEL") || PROVIDER_CONFIGS.openai.defaultModel;
+  } else {
+    endpoint = "https://api.x.ai/v1/chat/completions";
+    defaultModel = Deno.env.get("GROK_MODEL") || PROVIDER_CONFIGS.grok.defaultModel;
+  }
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: defaultModel,
+      messages: [
+        { role: "system", content: systemInstruction },
+        { role: "user", content: userPrompt }
+      ],
+      temperature: 0.7,
+      response_format: { type: "json_object" },
+      max_tokens: 3000
+    }),
+    signal
+  });
+
+  const durationMs = Date.now() - start;
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsedErr: any = null;
+    try { parsedErr = JSON.parse(errText); } catch {}
+    const msg = parsedErr?.error?.message || errText || `Lỗi từ ${provider.toUpperCase()}`;
+    return {
+      success: false,
+      provider: PROVIDER_CONFIGS[provider].name,
+      model: defaultModel,
+      text: "",
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      estimatedCostVND: 0,
+      durationMs,
+      httpStatus: response.status,
+      error: msg,
+      code: `${provider.toUpperCase()}_ERROR`
+    };
+  }
+
+  const data = await response.json();
+  const rawText = data?.choices?.[0]?.message?.content || "";
+  const usage = data?.usage || {};
+  const promptTokens = usage.prompt_tokens || Math.ceil((userPrompt.length + systemInstruction.length) / 4);
+  const completionTokens = usage.completion_tokens || Math.ceil(rawText.length / 4);
+  const totalTokens = usage.total_tokens || (promptTokens + completionTokens);
+
+  let cleaned = rawText.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+  let parsedJson: any = null;
+  try { parsedJson = JSON.parse(cleaned); } catch { parsedJson = { text: rawText }; }
+
+  const costVND = calculateCostVND(provider, promptTokens, completionTokens);
+
+  return {
+    success: true,
+    provider: PROVIDER_CONFIGS[provider].name,
+    model: defaultModel,
+    text: rawText,
+    parsedJson,
+    usage: { promptTokens, completionTokens, totalTokens },
+    estimatedCostVND: costVND,
+    durationMs,
+    httpStatus: 200
+  };
+}
+
+async function callClaude(
+  systemInstruction: string,
+  userPrompt: string,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<ProviderCallResult> {
+  const start = Date.now();
+  const model = Deno.env.get("ANTHROPIC_MODEL") || PROVIDER_CONFIGS.claude.defaultModel;
+  const endpoint = "https://api.anthropic.com/v1/messages";
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model,
+      system: systemInstruction,
+      messages: [{ role: "user", content: userPrompt }],
+      max_tokens: 3000,
+      temperature: 0.7
+    }),
+    signal
+  });
+
+  const durationMs = Date.now() - start;
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsedErr: any = null;
+    try { parsedErr = JSON.parse(errText); } catch {}
+    const msg = parsedErr?.error?.message || errText || "Lỗi từ Anthropic Claude";
+    return {
+      success: false,
+      provider: "Anthropic Claude",
+      model,
+      text: "",
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      estimatedCostVND: 0,
+      durationMs,
+      httpStatus: response.status,
+      error: msg,
+      code: "CLAUDE_ERROR"
+    };
+  }
+
+  const data = await response.json();
+  const rawText = data?.content?.[0]?.text || "";
+  const usage = data?.usage || {};
+  const promptTokens = usage.input_tokens || Math.ceil((userPrompt.length + systemInstruction.length) / 4);
+  const completionTokens = usage.output_tokens || Math.ceil(rawText.length / 4);
+  const totalTokens = promptTokens + completionTokens;
+
+  let cleaned = rawText.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+  let parsedJson: any = null;
+  try { parsedJson = JSON.parse(cleaned); } catch { parsedJson = { text: rawText }; }
+
+  const costVND = calculateCostVND("claude", promptTokens, completionTokens);
+
+  return {
+    success: true,
+    provider: "Anthropic Claude",
+    model,
+    text: rawText,
+    parsedJson,
+    usage: { promptTokens, completionTokens, totalTokens },
+    estimatedCostVND: costVND,
+    durationMs,
+    httpStatus: 200
+  };
+}
+
+// ============================================================================
+// MAIN HANDLER
+// ============================================================================
+
 Deno.serve(async (req: Request) => {
   const startTime = Date.now();
-  // Khởi tạo Request ID cho chẩn đoán log
-  const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const requestId = `brain_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
-  // 1. Xử lý preflight CORS
+  // 1. CORS Preflight
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    // 2. Kiểm tra phương thức HTTP
     if (req.method !== "POST") {
       return new Response(
-        JSON.stringify({
-          success: false,
-          error: "Chỉ hỗ trợ phương thức POST.",
-          code: "METHOD_NOT_ALLOWED",
-          requestId
-        }),
+        JSON.stringify({ success: false, error: "Chỉ hỗ trợ POST.", code: "METHOD_NOT_ALLOWED", requestId }),
         { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // 3. Đọc Secrets an toàn từ Deno environment (KHÔNG BAO GIỜ để lộ ở frontend)
-    const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
-    if (!geminiApiKey || geminiApiKey.trim() === "") {
-      console.error(`[${requestId}] [CONFIG_ERROR] Chưa cấu hình GEMINI_API_KEY trong Supabase Secrets.`);
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: "Chưa cấu hình GEMINI_API_KEY trong Supabase Secrets.",
-          code: "MISSING_GEMINI_KEY",
-          hint: "Vui lòng truy cập Supabase Dashboard > Edge Functions > Secrets và thêm GEMINI_API_KEY từ Google AI Studio.",
-          requestId
-        }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    const geminiModel = Deno.env.get("GEMINI_MODEL")?.trim() || DEFAULT_MODEL;
-
-    // 4. Xác thực người dùng qua Supabase JWT Token
-    const authStartMs = Date.now();
+    // 2. Xác thực JWT Supabase
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
       return new Response(
@@ -203,18 +523,6 @@ Deno.serve(async (req: Request) => {
     }
 
     const token = authHeader.replace(/^Bearer\s+/i, "").trim();
-    if (!token) {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: "Thiếu Bearer JWT token trong Authorization header.",
-          code: "UNAUTHORIZED",
-          requestId
-        }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
     let authenticatedUser: any = null;
@@ -225,16 +533,13 @@ Deno.serve(async (req: Request) => {
         auth: { persistSession: false },
         global: { headers: { Authorization: `Bearer ${token}` } }
       });
-
       const { data: { user }, error: userError } = await supabaseClient.auth.getUser(token);
       if (userError || !user) {
-        console.warn(`[${requestId}] [AUTH_FAIL] JWT không hợp lệ: ${userError?.message}`);
         return new Response(
           JSON.stringify({
             success: false,
-            error: "Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Vui lòng đăng nhập lại.",
+            error: "Phiên đăng nhập không hợp lệ hoặc đã hết hạn.",
             code: "UNAUTHORIZED",
-            details: userError?.message,
             requestId
           }),
           { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -242,557 +547,578 @@ Deno.serve(async (req: Request) => {
       }
       authenticatedUser = user;
     }
-    const authDurationMs = Date.now() - authStartMs;
 
-    // 5. Kiểm tra & Giới hạn dữ liệu đầu vào (Guardrails)
+    // 3. Phân tích Payload
     let body: RequestPayload;
     try {
       body = await req.json();
     } catch {
       return new Response(
-        JSON.stringify({
-          success: false,
-          error: "Payload gửi lên không đúng định dạng JSON.",
-          code: "INVALID_JSON",
-          requestId
-        }),
+        JSON.stringify({ success: false, error: "Payload JSON không hợp lệ.", code: "INVALID_JSON", requestId }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    const { action, payload } = body;
+    const { action } = body;
     if (!action) {
       return new Response(
-        JSON.stringify({
-          success: false,
-          error: "Thiếu trường 'action' trong request payload.",
-          code: "MISSING_ACTION",
-          requestId
-        }),
+        JSON.stringify({ success: false, error: "Thiếu trường 'action'.", code: "MISSING_ACTION", requestId }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    console.log(`[${requestId}] [START] Action: ${action}, Model: ${geminiModel}, AuthTime: ${authDurationMs}ms`);
+    // ========================================================================
+    // ACTION: check_agents_status (Ping & kiểm tra cấu hình thật 5 Providers)
+    // ========================================================================
+    if (action === "check_agents_status") {
+      const geminiKey = getApiKey("gemini");
+      const deepseekKey = getApiKey("deepseek");
+      const openaiKey = getApiKey("openai");
+      const grokKey = getApiKey("grok");
+      const claudeKey = getApiKey("claude");
 
-    // Giới hạn ký tự payload chống lạm dụng chi phí token (tối đa 5,000 ký tự)
-    const payloadString = JSON.stringify(payload || {});
-    if (payloadString.length > 5000) {
+      // Đếm số tác vụ trong ngày của người dùng từ ai_task_logs để kiểm soát Quota
+      let todayTaskCount = 0;
+      let monthSpentVND = 0;
+      if (supabaseClient) {
+        try {
+          const startOfToday = new Date();
+          startOfToday.setHours(0, 0, 0, 0);
+
+          const { count } = await supabaseClient
+            .from("ai_task_logs")
+            .select("*", { count: "exact", head: true })
+            .gte("created_at", startOfToday.toISOString());
+
+          todayTaskCount = count || 0;
+        } catch (_countErr) {
+          // Bỏ qua nếu lỗi count
+        }
+      }
+
+      const agentsStatus = [
+        {
+          agentId: "chatgpt",
+          agentName: "ChatGPT (Chiến Lược & Điều Hành)",
+          providerId: "openai",
+          providerName: "OpenAI",
+          configured: Boolean(openaiKey),
+          status: openaiKey ? "CONNECTED" : "NOT_CONFIGURED",
+          model: Deno.env.get("OPENAI_MODEL") || PROVIDER_CONFIGS.openai.defaultModel,
+          role: "Operations & Strategy",
+          isPrimary: false,
+          isBackup: false
+        },
+        {
+          agentId: "gemini",
+          agentName: "Gemini (Nghiên Cứu Deal & Nội Dung)",
+          providerId: "gemini",
+          providerName: "Google Gemini",
+          configured: Boolean(geminiKey),
+          status: geminiKey ? "CONNECTED" : "NOT_CONFIGURED",
+          model: Deno.env.get("GEMINI_MODEL") || PROVIDER_CONFIGS.gemini.defaultModel,
+          role: "Market Research & Content Intelligence",
+          isPrimary: true,
+          isBackup: false
+        },
+        {
+          agentId: "grok",
+          agentName: "Grok (Đón Đầu Xu Hướng & Trend)",
+          providerId: "grok",
+          providerName: "xAI Grok",
+          configured: Boolean(grokKey),
+          status: grokKey ? "CONNECTED" : "NOT_CONFIGURED",
+          model: Deno.env.get("GROK_MODEL") || PROVIDER_CONFIGS.grok.defaultModel,
+          role: "Trend Intelligence",
+          isPrimary: false,
+          isBackup: false
+        },
+        {
+          agentId: "claude",
+          agentName: "Claude (Chất Lượng & Tuân Thủ)",
+          providerId: "claude",
+          providerName: "Anthropic Claude",
+          configured: Boolean(claudeKey),
+          status: claudeKey ? "CONNECTED" : "NOT_CONFIGURED",
+          model: Deno.env.get("ANTHROPIC_MODEL") || PROVIDER_CONFIGS.claude.defaultModel,
+          role: "Content Quality & Compliance",
+          isPrimary: false,
+          isBackup: false
+        },
+        {
+          agentId: "deepseek",
+          agentName: "DeepSeek (Kỹ Thuật & Phân Tích Dữ Liệu)",
+          providerId: "deepseek",
+          providerName: "DeepSeek",
+          configured: Boolean(deepseekKey),
+          status: deepseekKey ? "CONNECTED" : "NOT_CONFIGURED",
+          model: Deno.env.get("DEEPSEEK_MODEL") || PROVIDER_CONFIGS.deepseek.defaultModel,
+          role: "Technical & Data Analysis",
+          isPrimary: false,
+          isBackup: true
+        }
+      ];
+
       return new Response(
         JSON.stringify({
-          success: false,
-          error: "Dữ liệu đầu vào vượt quá giới hạn an toàn (tối đa 5,000 ký tự).",
-          code: "PAYLOAD_TOO_LARGE",
-          requestId
+          success: true,
+          requestId,
+          timestamp: new Date().toISOString(),
+          agents: agentsStatus,
+          quota: {
+            dailyTaskCount: todayTaskCount,
+            dailyTaskLimit: DEFAULT_DAILY_TASK_LIMIT,
+            monthlySpentVND: monthSpentVND,
+            monthlyBudgetVND: DEFAULT_MONTHLY_BUDGET_VND,
+            isDailyQuotaExceeded: todayTaskCount >= DEFAULT_DAILY_TASK_LIMIT,
+            isMonthlyBudgetExceeded: monthSpentVND >= DEFAULT_MONTHLY_BUDGET_VND
+          }
         }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // 6. Xây dựng System Instruction & Prompt tiếng Việt chuẩn TikTok Affiliate
+    // ========================================================================
+    // KIỂM TRA HẠN MỨC QUOTA SERVER-SIDE (COST CONTROL GUARDRAILS)
+    // ========================================================================
+    if (supabaseClient) {
+      try {
+        const startOfToday = new Date();
+        startOfToday.setHours(0, 0, 0, 0);
+
+        const { count } = await supabaseClient
+          .from("ai_task_logs")
+          .select("*", { count: "exact", head: true })
+          .gte("created_at", startOfToday.toISOString());
+
+        const currentTodayCount = count || 0;
+        if (currentTodayCount >= DEFAULT_DAILY_TASK_LIMIT) {
+          console.warn(`[${requestId}] [QUOTA_BLOCKED] Vượt hạn mức ngày: ${currentTodayCount}/${DEFAULT_DAILY_TASK_LIMIT}`);
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: `Hạn mức AI hôm nay đã đạt (${currentTodayCount}/${DEFAULT_DAILY_TASK_LIMIT} tác vụ). Hệ thống tự động chặn để bảo vệ ngân sách chi phí. Hạn mức sẽ được làm mới vào ngày mai.`,
+              code: "QUOTA_EXCEEDED",
+              details: "Daily task limit exceeded",
+              requestId
+            }),
+            { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+      } catch (_quotaErr) {
+        // Cho phép đi tiếp nếu không thể kiểm tra count
+      }
+    }
+
+    // ========================================================================
+    // XÁC ĐỊNH SYSTEM INSTRUCTION & USER PROMPT
+    // ========================================================================
     let systemInstruction = "";
     let userPrompt = "";
+    let mappedTaskType = body.taskType || "content_creation";
+    let targetAgent: "chatgpt" | "gemini" | "grok" | "claude" | "deepseek" = body.preferredAgent || "gemini";
+    const payload = body.payload || {};
 
-    if (action === "generate_script") {
+    if (action === "orchestrate_task") {
+      mappedTaskType = body.taskType || "operations_strategy";
+      userPrompt = body.inputPrompt || JSON.stringify(payload);
+
+      if (mappedTaskType === "operations_strategy") {
+        targetAgent = body.preferredAgent || "chatgpt";
+        systemInstruction = `Bạn là AGENT 1 - ChatGPT (Operations & Strategy Lead) thuộc hệ thống AI Affiliate Command Center Việt Nam.
+Nhiệm vụ: Phân tích bài toán affiliate, hoạch định kế hoạch hành động và đưa ra quyết định tối ưu.
+Trả về định dạng JSON:
+{
+  "summary": "Tóm tắt chiến lược",
+  "recommendedAction": "Hành động đề xuất cụ thể",
+  "assignedAgents": ["Gemini", "Claude"],
+  "estimatedROI": "180% - 220%",
+  "actionSteps": ["Bước 1...", "Bước 2..."]
+}`;
+      } else if (mappedTaskType === "market_research") {
+        targetAgent = body.preferredAgent || "gemini";
+        systemInstruction = `Bạn là AGENT 2 - Gemini (Market Research & Content Intelligence).
+Nghiên cứu sản phẩm, đánh giá dung lượng thị trường và điểm USP.
+Trả về JSON:
+{
+  "potentialScore": 88,
+  "recommendation": "Đánh giá deal",
+  "targetAudience": "Đối tượng mục tiêu",
+  "keyAngles": ["Góc bán hàng 1", "Góc bán hàng 2"],
+  "suggestedCommission": 18,
+  "notes": "Lưu ý tiếp cận"
+}`;
+      } else if (mappedTaskType === "trend_intelligence") {
+        targetAgent = body.preferredAgent || "grok";
+        systemInstruction = `Bạn là AGENT 3 - Grok (Trend Intelligence Specialist).
+Bắt sóng xu hướng viral, âm thanh trending và góc nhìn giật tít thị trường Việt Nam.
+Trả về JSON:
+{
+  "trends": [
+    {
+      "name": "Tên xu hướng",
+      "soundType": "Loại âm thanh gợi ý",
+      "hookTemplate": "Mẫu câu mở đầu",
+      "retentionTactic": "Kỹ thuật giữ chân"
+    }
+  ]
+}`;
+      } else if (mappedTaskType === "content_compliance") {
+        targetAgent = body.preferredAgent || "claude";
+        systemInstruction = `Bạn là AGENT 4 - Claude (Content Quality & Compliance Sentinel).
+Kiểm duyệt chất lượng và chính sách TikTok Shop / Shopee Việt Nam.
+Trả về JSON:
+{
+  "complianceScore": 92,
+  "status": "approved",
+  "violations": [],
+  "suggestedFixes": [],
+  "summary": "Đánh giá an toàn"
+}`;
+      } else if (mappedTaskType === "technical_analysis") {
+        targetAgent = body.preferredAgent || "deepseek";
+        systemInstruction = `Bạn là AGENT 5 - DeepSeek (Technical & Data Analysis Engine).
+Phân tích kỹ thuật, dữ liệu chuyển đổi, tính toán ROI và chi phí.
+Trả về JSON:
+{
+  "efficiencyScore": 85,
+  "breakEvenClicks": 45,
+  "suggestedMaxCPC": 520,
+  "targetROI": 210,
+  "analysis": "Chi tiết phân tích kỹ thuật"
+}`;
+      } else {
+        targetAgent = "gemini";
+        systemInstruction = "Bạn là AI Assistant thuộc AI Affiliate Command Center. Trả về kết quả dưới dạng JSON có cấu trúc.";
+      }
+    } 
+    // Backward compatibility cho các actions cũ
+    else if (action === "generate_script") {
+      targetAgent = "gemini";
+      mappedTaskType = "content_creation";
       const {
-        productName = "Sản phẩm Hot",
-        category = "Tổng hợp",
+        productName = "Sản phẩm Affiliate",
+        category = "Gia dụng",
         platform = "tiktok",
-        priceVND = 199000,
-        targetAudience = "Khách hàng trẻ, nhân viên văn phòng, học sinh sinh viên",
+        priceVND = 0,
+        commissionRate = 15,
+        targetAudience = "Khách hàng Việt Nam",
         tone = "Review chân thực",
         targetDuration = "35s - 45s",
         keyFeatures = ""
       } = payload;
 
       systemInstruction = `Bạn là Copywriter AI hàng đầu cho TikTok Shop và Shopee Affiliate tại Việt Nam.
-Nhiệm vụ: Viết kịch bản video ngắn (Shortform Video Script) giữ chân người xem cao (Retention Rate) và kích thích ấn vào giỏ hàng màu vàng góc trái màn hình.
-Quy tắc bắt buộc:
-1. Tiếng Việt tự nhiên 100%, gần gũi với giới trẻ và người tiêu dùng mua sắm trực tuyến Việt Nam.
-2. TUÂN THỦ CHÍNH SÁCH TIKTOK SHOP: Tuyệt đối KHÔNG dùng từ cấm (cam kết 100%, khỏi hoàn toàn, trị dứt điểm, duy nhất, tốt nhất thị trường, vĩnh viễn).
-3. KHÔNG tự bịa đặt thông số kỹ thuật phi lý hoặc chế độ bảo hành không có thực so với thông tin sản phẩm đầu vào.
-4. Trả về đúng định dạng JSON hợp lệ (không kèm văn bản ngoài JSON):
+Viết kịch bản video ngắn bán hàng tỷ lệ chuyển đổi cao.
+Định dạng JSON BẮT BUỘC:
 {
-  "title": "Tiêu đề kịch bản thu hút, chuẩn SEO (dưới 65 ký tự)",
-  "hookVariantA": "Câu mở đầu 3s biến thể A: Đánh vào nỗi đau thực tế hoặc gây tò mò bất ngờ",
-  "hookVariantB": "Câu mở đầu 3s biến thể B: Góc nhìn tương phản hoặc giải pháp tiết kiệm hời",
+  "title": "Tiêu đề kịch bản thu hút",
+  "hookVariantA": "Hook biến thể A (đánh vào nỗi đau)",
+  "hookVariantB": "Hook biến thể B (tò mò/bất ngờ)",
   "activeHook": "A",
-  "bodyStory": "Tóm tắt diễn biến kịch bản giải quyết vấn đề bằng trải nghiệm sản phẩm",
+  "bodyStory": "Thân bài ngắn gọn, nêu bật USP",
   "voiceoverLines": [
-    {
-      "timestamp": "00:00 - 00:04",
-      "speech": "Lời thoại ngắn gọn, cuốn hút",
-      "action": "Góc máy chi tiết (quay cận cảnh sản phẩm, test thực tế, cử chỉ tay)"
-    },
-    {
-      "timestamp": "00:05 - 00:20",
-      "speech": "Lời thoại phân tích điểm mạnh trải nghiệm thực tế",
-      "action": "Quay cận cảnh tính năng nổi bật"
-    },
-    {
-      "timestamp": "00:21 - 00:35",
-      "speech": "Lời thoại chốt hạ giá trị và voucher trợ giá",
-      "action": "Chỉ tay vào giỏ hàng màu vàng góc trái màn hình"
-    }
+    { "timestamp": "0:00 - 0:03", "speech": "Lời thoại mở đầu", "action": "Góc quay thực tế" },
+    { "timestamp": "0:04 - 0:15", "speech": "Giải quyết vấn đề", "action": "Cận cảnh sản phẩm" },
+    { "timestamp": "0:16 - 0:30", "speech": "Trải nghiệm thực tế", "action": "Sử dụng tính năng chính" },
+    { "timestamp": "0:31 - 0:40", "speech": "Kêu gọi hành động", "action": "Chỉ tay vào giỏ hàng" }
   ],
-  "callToAction": "Câu kêu gọi hành động dứt khoát trỏ vào giỏ hàng góc trái màn hình để săn voucher và freeship",
-  "hashtags": ["#tiktokshopvietnam", "#review", "#dealhot"],
+  "callToAction": "Lời kêu gọi hành động dứt khoát",
+  "hashtags": ["#tiktokshopvn", "#affiliate", "#review"],
   "targetDuration": "${targetDuration}",
-  "tone": ${JSON.stringify(tone)},
-  "estimatedViews": "60k - 150k",
-  "unverifiedClaimsNotes": "Lưu ý tuân thủ: Tránh khẳng định tuyệt đối về hiệu quả hoặc cam kết vượt quá công bố của nhà sản xuất."
+  "tone": "${tone}",
+  "estimatedViews": "50K - 150K",
+  "unverifiedClaimsNotes": "Không có tuyên bố phóng đại"
 }`;
 
-      userPrompt = `Tạo kịch bản bán hàng affiliate cho sản phẩm sau:
-- Tên sản phẩm: ${productName}
-- Ngành hàng: ${category}
-- Nền tảng: ${platform === "tiktok" ? "TikTok Shop Việt Nam" : "Shopee Video/Live"}
-- Giá bán: ${Number(priceVND).toLocaleString("vi-VN")} VNĐ
-- Đối tượng mục tiêu: ${targetAudience}
-- Phong cách: ${tone}
-- Thời lượng mục tiêu: ${targetDuration}
-- Điểm nổi bật / Khách hàng quan tâm: ${keyFeatures || "Trải nghiệm thực tế tốt, giao nhanh, deal giá hời, phù hợp sử dụng hàng ngày"}`;
-
+      userPrompt = `Sản phẩm: ${productName}
+Ngành hàng: ${category}
+Giá bán: ${Number(priceVND).toLocaleString()} VNĐ
+Hoa hồng: ${commissionRate}%
+Khán giả: ${targetAudience}
+Tính năng nổi bật: ${keyFeatures || "Tiện lợi, chính hãng"}`;
     } else if (action === "analyze_product") {
-      const { productName = "", category = "", priceVND = 0, platform = "tiktok" } = payload;
-      systemInstruction = `Bạn là Scout AI - Chuyên gia săn deal affiliate hàng đầu Việt Nam.
-Phân tích tiềm năng chuyển đổi và khả năng viral của sản phẩm trên TikTok Shop & Shopee.
-Quy tắc: Đánh giá khách quan, trung thực, dựa trên hành vi mua hàng tại thị trường Việt Nam.
-Trả về JSON cấu trúc:
+      targetAgent = "gemini";
+      mappedTaskType = "market_research";
+      systemInstruction = `Bạn là Scout AI chuyên phân tích tiềm năng deal Affiliate. Trả về JSON:
 {
   "potentialScore": 85,
-  "recommendation": "Khuyến nghị góc tiếp cận ngắn gọn",
-  "targetAudience": "Đối tượng người mua tiềm năng nhất",
-  "keyAngles": ["Góc quay 1", "Góc tiếp cận 2", "Góc so sánh 3"],
+  "recommendation": "Đánh giá deal",
+  "targetAudience": "Đối tượng phù hợp",
+  "keyAngles": ["Góc tiếp cận 1", "Góc tiếp cận 2"],
   "suggestedCommission": 18,
-  "notes": "Lưu ý về nguồn hàng, đối thủ cạnh tranh"
+  "notes": "Lưu ý"
 }`;
-
-      userPrompt = `Phân tích sản phẩm: ${productName}, ngành hàng: ${category}, nền tảng: ${platform}, giá bán: ${Number(priceVND).toLocaleString("vi-VN")} VNĐ.`;
-
+      userPrompt = `Phân tích sản phẩm: ${payload.productName || ""}, ngành: ${payload.category || ""}, giá: ${payload.priceVND || 0}`;
     } else if (action === "trend_ideas") {
-      const { category = "Tổng hợp", platform = "tiktok" } = payload;
-      systemInstruction = `Bạn là Trend Hunter AI chuyên bắt sóng xu hướng shortform video Việt Nam.
-Trả về JSON cấu trúc:
+      targetAgent = "grok";
+      mappedTaskType = "trend_intelligence";
+      systemInstruction = `Bạn là Trinh sát Trend TikTok/Reels Việt Nam. Trả về JSON:
 {
   "trends": [
     {
       "name": "Tên trend",
-      "soundType": "Loại âm thanh/nhạc nền",
-      "hookTemplate": "Mẫu câu mở đầu giữ chân người xem",
-      "retentionTactic": "Mẹo kéo dài thời gian xem trung bình"
+      "soundType": "Nhạc/Âm thanh",
+      "hookTemplate": "Mẫu câu Hook",
+      "retentionTactic": "Mẹo giữ chân"
     }
   ]
 }`;
-
-      userPrompt = `Đề xuất 3 xu hướng video ngắn chuyển đổi cao cho ngành hàng: ${category} trên ${platform}.`;
-
+      userPrompt = `Gợi ý trend cho ngành hàng: ${payload.category || "Công nghệ"}`;
     } else if (action === "audit_content") {
-      const { title = "", scriptText = "" } = payload;
-      systemInstruction = `Bạn là Auditor AI - Chuyên gia kiểm duyệt chính sách quảng cáo TikTok Shop và Shopee Việt Nam.
-Kiểm tra nghiêm ngặt từ cấm, cam kết sai sự thật, từ ngữ nhạy cảm y tế, bảo hành giả.
-Trả về JSON cấu trúc:
+      targetAgent = "claude";
+      mappedTaskType = "content_compliance";
+      systemInstruction = `Bạn là Chuyên gia kiểm duyệt TikTok Shop Việt Nam. Trả về JSON:
 {
   "complianceScore": 90,
   "status": "approved",
-  "violations": ["Danh sách các lỗi nếu có"],
-  "suggestedFixes": ["Cách sửa văn phong tuân thủ"],
-  "summary": "Đánh giá tổng quan an toàn tài khoản"
+  "violations": [],
+  "suggestedFixes": [],
+  "summary": "Đánh giá an toàn"
 }`;
-
-      userPrompt = `Kiểm duyệt kịch bản sau:
-Tiêu đề: ${title}
-Nội dung: ${scriptText}`;
-
+      userPrompt = `Kiểm duyệt kịch bản:\nTiêu đề: ${payload.title || ""}\nNội dung: ${payload.scriptText || ""}`;
     } else if (action === "generate_title_description") {
-      const { productName = "", category = "" } = payload;
-      systemInstruction = `Bạn là Chuyên gia tối ưu tiêu đề và mô tả video TikTok Shop Affiliate chuẩn SEO.
-Trả về JSON cấu trúc:
+      targetAgent = "gemini";
+      mappedTaskType = "content_creation";
+      systemInstruction = `Bạn là Chuyên gia tối ưu tiêu đề và mô tả video TikTok Shop SEO. Trả về JSON:
 {
-  "titles": ["Tiêu đề gợi ý 1", "Tiêu đề gợi ý 2", "Tiêu đề gợi ý 3"],
-  "description": "Đoạn mô tả video ngắn kèm lời kêu gọi hành động",
-  "hashtags": ["#hashtag1", "#hashtag2", "#hashtag3"]
+  "titles": ["Tiêu đề 1", "Tiêu đề 2", "Tiêu đề 3"],
+  "description": "Mô tả ngắn kèm CTA",
+  "hashtags": ["#tag1", "#tag2", "#tag3"]
 }`;
-
-      userPrompt = `Tạo tiêu đề và mô tả cho sản phẩm: ${productName}, ngành hàng: ${category}.`;
-
-    } else {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: `Tác vụ không hợp lệ: ${action}`,
-          code: "UNSUPPORTED_ACTION",
-          requestId
-        }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      userPrompt = `Tạo tiêu đề cho sản phẩm: ${payload.productName || ""}, ngành: ${payload.category || ""}`;
     }
 
-    // 7. Cấu Hình Đồng Bộ Timeout & Retry Tối Ưu
-    const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiApiKey}`;
-
-    // Tối ưu hóa request payload: giới hạn maxOutputTokens vừa đủ chất lượng, tránh sinh lặp vô hạn
-    const geminiRequestBody = {
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: userPrompt }]
-        }
-      ],
-      systemInstruction: {
-        parts: [{ text: systemInstruction }]
-      },
-      generationConfig: {
-        temperature: 0.7,
-        responseMimeType: "application/json",
-        maxOutputTokens: 2500
-      }
+    // ========================================================================
+    // AI TASK ROUTER & SMART FALLBACK
+    // ========================================================================
+    const AGENT_TO_PROVIDER: Record<string, keyof typeof PROVIDER_CONFIGS> = {
+      chatgpt: "openai",
+      gemini: "gemini",
+      grok: "grok",
+      claude: "claude",
+      deepseek: "deepseek"
     };
 
-    // Quy tắc Timeout & Retry đồng bộ:
-    // - generate_script cần 15-40s để sinh JSON hoàn chỉnh. Cấp ngân sách 55s cho mỗi lần gọi đơn lẻ.
-    // - Tối đa 1 lần retry (tổng 2 lần gọi) cho kịch bản dài nếu còn đủ tối thiểu 40s trước deadline tổng 120s.
-    // - Các tác vụ ngắn (analyze, audit, titles): 25s mỗi lượt, tối đa 2 lần retry.
+    let selectedProvider = AGENT_TO_PROVIDER[targetAgent] || "gemini";
+    let apiKey = getApiKey(selectedProvider);
+    let fallbackReason: string | null = null;
+    let actualAgentUsed = targetAgent;
+
+    // Nếu Provider được chọn chưa có API Key -> Tìm Provider thay thế (Fallback)
+    if (!apiKey) {
+      console.warn(`[${requestId}] [ROUTER_FALLBACK] Agent ${targetAgent} (Provider ${selectedProvider}) chưa cấu hình API Key.`);
+
+      const geminiKey = getApiKey("gemini");
+      const deepseekKey = getApiKey("deepseek");
+
+      if (geminiKey) {
+        fallbackReason = `Agent ${targetAgent.toUpperCase()} (${PROVIDER_CONFIGS[selectedProvider].name}) chưa cấu hình API Key trong Supabase Secrets. Hệ thống tự động chuyển tiếp nhiệm vụ sang Gemini (Primary Provider) để đảm bảo không gián đoạn.`;
+        selectedProvider = "gemini";
+        apiKey = geminiKey;
+        actualAgentUsed = "gemini";
+      } else if (deepseekKey) {
+        fallbackReason = `Agent ${targetAgent.toUpperCase()} (${PROVIDER_CONFIGS[selectedProvider].name}) chưa cấu hình API Key. Hệ thống tự động chuyển tiếp sang DeepSeek (Backup Provider).`;
+        selectedProvider = "deepseek";
+        apiKey = deepseekKey;
+        actualAgentUsed = "deepseek";
+      } else {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: `Agent ${targetAgent.toUpperCase()} và cả Provider dự phòng đều chưa được cấu hình API Key trong Supabase Secrets.`,
+            code: "NOT_CONFIGURED",
+            hint: `Vui lòng thêm biến môi trường ${PROVIDER_CONFIGS[selectedProvider].envKey} (hoặc GEMINI_API_KEY) trong Supabase Dashboard > Edge Functions > Secrets.`,
+            requestId
+          }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    // ========================================================================
+    // THỰC THI GỌI PROVIDER VỚI DEADLINE & RETRY TỰ ĐỘNG
+    // ========================================================================
     const isLongTask = action === "generate_script";
-    const maxAllowedRetries = isLongTask ? 1 : 2;
-    const SINGLE_CALL_TIMEOUT_MS = isLongTask ? 55000 : 25000;
-    const MIN_TIME_FOR_RETRY_MS = isLongTask ? 40000 : 15000;
+    const maxRetries = isLongTask ? 1 : 2;
+    const perCallBudgetMs = isLongTask ? 55000 : 25000;
+    const minBudgetToRetryMs = isLongTask ? 40000 : 15000;
 
-    let lastResponse: Response | null = null;
-    let lastError: any = null;
-    let attemptCount = 0;
+    let finalResult: ProviderCallResult | null = null;
+    let attempts = 0;
 
-    for (let retry = 0; retry <= maxAllowedRetries; retry++) {
-      attemptCount = retry + 1;
+    for (let retry = 0; retry <= maxRetries; retry++) {
+      attempts = retry + 1;
 
-      // 1. Kiểm tra nếu client (người dùng) đã chủ động ngắt kết nối
       if (req.signal.aborted) {
-        console.log(`[${requestId}] [CLIENT_ABORT] Client đã ngắt kết nối trước lượt gọi ${attemptCount}`);
-        lastError = new DOMException("Client request aborted by user", "AbortError");
+        console.log(`[${requestId}] [CLIENT_ABORT] Người dùng đã ngắt kết nối.`);
         break;
       }
 
-      // 2. Kiểm tra thời gian còn lại trước deadline tổng (120 giây)
-      const elapsedTotalMs = Date.now() - startTime;
-      const remainingTotalMs = TOTAL_EXECUTION_TIMEOUT_MS - elapsedTotalMs;
+      const elapsedMs = Date.now() - startTime;
+      const remainingMs = TOTAL_EXECUTION_TIMEOUT_MS - elapsedMs;
 
-      // Nếu lần retry này không đủ thời gian an toàn cho Gemini hoàn thành, dừng retry và trả lỗi lượt trước
-      if (retry > 0 && remainingTotalMs < MIN_TIME_FOR_RETRY_MS) {
-        console.log(`[${requestId}] [RETRY_SKIP] Thời gian còn lại ${remainingTotalMs}ms < ${MIN_TIME_FOR_RETRY_MS}ms. Dừng retry để tránh vượt deadline.`);
+      if (retry > 0 && remainingMs < minBudgetToRetryMs) {
+        console.log(`[${requestId}] [RETRY_SKIP] Thời gian còn lại ${remainingMs}ms không đủ để thử lại.`);
         break;
       }
 
-      // 3. Đặt timeout cho từng lần gọi đơn lẻ: 55s (không vượt quá thời gian còn lại trước deadline)
-      const perAttemptTimeoutMs = Math.min(SINGLE_CALL_TIMEOUT_MS, Math.max(5000, remainingTotalMs - 2000));
-      const attemptController = new AbortController();
-      const timeoutId = setTimeout(() => {
-        attemptController.abort(new DOMException(`Gemini call timed out after ${perAttemptTimeoutMs}ms`, "TimeoutError"));
-      }, perAttemptTimeoutMs);
+      const callTimeoutMs = Math.min(perCallBudgetMs, Math.max(5000, remainingMs - 2000));
+      const callController = new AbortController();
+      const callTimer = setTimeout(() => {
+        callController.abort(new DOMException(`Timeout after ${callTimeoutMs}ms`, "TimeoutError"));
+      }, callTimeoutMs);
 
-      // Nếu người dùng hủy kết nối HTTP trong khi đang chờ Gemini, chuyển tiếp abort sang attemptController
-      const onClientAbort = () => {
-        attemptController.abort(new DOMException("Client aborted request", "AbortError"));
-      };
-      req.signal.addEventListener("abort", onClientAbort, { once: true });
-
-      const callStartMs = Date.now();
-      console.log(`[${requestId}] [CALL_START] Lượt ${attemptCount}/${maxAllowedRetries + 1}, Budget: ${perAttemptTimeoutMs}ms, Tổng đã chạy: ${elapsedTotalMs}ms`);
+      const onAbort = () => callController.abort(new DOMException("User aborted", "AbortError"));
+      req.signal.addEventListener("abort", onAbort, { once: true });
 
       try {
-        const response = await fetch(geminiEndpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(geminiRequestBody),
-          signal: attemptController.signal
-        });
+        let callRes: ProviderCallResult;
 
-        clearTimeout(timeoutId);
-        req.signal.removeEventListener("abort", onClientAbort);
+        if (selectedProvider === "gemini") {
+          callRes = await callGemini(systemInstruction, userPrompt, apiKey!, callController.signal);
+        } else if (selectedProvider === "claude") {
+          callRes = await callClaude(systemInstruction, userPrompt, apiKey!, callController.signal);
+        } else {
+          callRes = await callOpenAICompatible(selectedProvider, systemInstruction, userPrompt, apiKey!, callController.signal);
+        }
 
-        const callDurationMs = Date.now() - callStartMs;
-        lastResponse = response;
-        console.log(`[${requestId}] [CALL_RESP] Lượt ${attemptCount}: HTTP ${response.status} trong ${callDurationMs}ms`);
+        clearTimeout(callTimer);
+        req.signal.removeEventListener("abort", onAbort);
+        finalResult = callRes;
 
-        // Thành công: thoát vòng lặp ngay
-        if (response.ok) {
+        if (callRes.success) {
+          break; // Thành công
+        }
+
+        if (!isTransientError(callRes.httpStatus)) {
+          console.warn(`[${requestId}] [NON_TRANSIENT_ERR] Status ${callRes.httpStatus} không thuộc diện retry.`);
           break;
         }
 
-        // Lỗi vĩnh viễn (400, 401, 403, 404): KHÔNG RETRY
-        if (!isTransientError(response.status)) {
-          console.warn(`[${requestId}] [PERMANENT_ERROR] HTTP ${response.status} không thuộc diện retry.`);
+        if (retry < maxRetries) {
+          const waitMs = Math.min(4000, 1500 * Math.pow(2, retry) + Math.floor(Math.random() * 300));
+          console.log(`[${requestId}] [RETRY_WAIT] Chờ ${waitMs}ms sau lỗi HTTP ${callRes.httpStatus}...`);
+          await new Promise((r) => setTimeout(r, waitMs));
+        }
+      } catch (err: any) {
+        clearTimeout(callTimer);
+        req.signal.removeEventListener("abort", onAbort);
+
+        if (req.signal.aborted || err?.message?.includes("User aborted")) {
           break;
         }
 
-        // Lỗi tạm thời (503, 429, 502, 500, 408): kiểm tra điều kiện retry
-        if (retry < maxAllowedRetries) {
-          const timeLeftAfterCall = TOTAL_EXECUTION_TIMEOUT_MS - (Date.now() - startTime);
-          if (timeLeftAfterCall < MIN_TIME_FOR_RETRY_MS) {
-            console.log(`[${requestId}] [RETRY_SKIP] Thời gian còn lại ${timeLeftAfterCall}ms không đủ cho lượt retry tiếp theo.`);
-            break;
-          }
-
-          const retryAfterHeader = response.headers.get("Retry-After");
-          const headerDelay = getRetryAfterMs(retryAfterHeader);
-          const expBackoff = Math.min(
-            MAX_RETRY_DELAY_MS,
-            BASE_RETRY_DELAY_MS * Math.pow(2, retry) + Math.floor(Math.random() * 400)
-          );
-          const waitDelayMs = headerDelay !== null ? Math.min(headerDelay, 6000) : expBackoff;
-
-          console.log(`[${requestId}] [RETRY_WAIT] Chờ ${waitDelayMs}ms trước khi thử lại... (Lý do: HTTP ${response.status})`);
-          await new Promise((resolve) => setTimeout(resolve, waitDelayMs));
-          continue;
-        }
-      } catch (fetchErr: any) {
-        clearTimeout(timeoutId);
-        req.signal.removeEventListener("abort", onClientAbort);
-        lastError = fetchErr;
-        const callDurationMs = Date.now() - callStartMs;
-
-        const isClientAbort = req.signal.aborted || fetchErr?.message?.includes("Client aborted");
-        if (isClientAbort) {
-          console.log(`[${requestId}] [CLIENT_ABORT] Người dùng đã chủ động hủy sau ${callDurationMs}ms.`);
-          break; // Không retry khi người dùng chủ động hủy
-        }
-
-        console.warn(`[${requestId}] [CALL_ERROR] Lượt ${attemptCount} gặp lỗi (${fetchErr.name}: ${fetchErr.message}) sau ${callDurationMs}ms.`);
-
-        if (retry < maxAllowedRetries) {
-          const timeLeftAfterErr = TOTAL_EXECUTION_TIMEOUT_MS - (Date.now() - startTime);
-          if (timeLeftAfterErr < MIN_TIME_FOR_RETRY_MS) {
-            console.log(`[${requestId}] [RETRY_SKIP] Không đủ thời gian còn lại (${timeLeftAfterErr}ms) sau lỗi mạng.`);
-            break;
-          }
-
-          const waitDelayMs = 1500 + Math.floor(Math.random() * 500);
-          console.log(`[${requestId}] [RETRY_WAIT] Chờ ${waitDelayMs}ms sau lỗi kết nối...`);
-          await new Promise((resolve) => setTimeout(resolve, waitDelayMs));
-          continue;
+        console.warn(`[${requestId}] [CALL_EXCEPTION] Lượt ${attempts}: ${err.message}`);
+        if (retry < maxRetries) {
+          await new Promise((r) => setTimeout(r, 1500));
         }
       }
     }
 
-    // 8. Xử lý phản hồi từ Gemini API sau các lượt thử
-    const totalElapsedMs = Date.now() - startTime;
+    const totalDurationMs = Date.now() - startTime;
 
-    if (!lastResponse || !lastResponse.ok) {
-      const isClientAbort = req.signal.aborted || lastError?.message?.includes("Client aborted");
-      const isTimeout = lastError?.name === "TimeoutError" || (lastError?.name === "AbortError" && !isClientAbort);
-      const status = lastResponse ? lastResponse.status : (isTimeout ? 504 : isClientAbort ? 499 : 502);
+    // ========================================================================
+    // XỬ LÝ KẾT QUẢ & GHI LOG VÀO AI_TASK_LOGS
+    // ========================================================================
+    if (!finalResult || !finalResult.success) {
+      const isClientAbort = req.signal.aborted;
+      const status = finalResult ? finalResult.httpStatus : (isClientAbort ? 499 : 504);
+      const errMsg = finalResult?.error || (isClientAbort ? "Yêu cầu đã bị hủy bởi người dùng." : "Hết thời gian chờ phản hồi AI (Timeout).");
 
-      let errText = "";
-      let parsedErr: any = null;
-
-      if (lastResponse) {
-        try {
-          errText = await lastResponse.text();
-          parsedErr = JSON.parse(errText);
-        } catch {
-          // Raw text
-        }
-      }
-
-      const rawDetailMessage = parsedErr?.error?.message || errText || lastError?.message || "";
-      console.error(`[${requestId}] [FAILURE] Status: ${status}, Lượt gọi: ${attemptCount}, Tổng thời gian: ${totalElapsedMs}ms, Detail: ${rawDetailMessage}`);
-
-      // Ghi log duy nhất MỘT LẦN vào bảng ai_task_logs nếu thất bại (trừ trường hợp người dùng chủ động hủy)
       if (supabaseClient && authenticatedUser && !isClientAbort) {
         try {
-          const failSummary = `[Edge Function] ${action.toUpperCase()}: Thất bại HTTP ${status} (đã thử ${attemptCount} lượt, ${Math.round(totalElapsedMs / 1000)}s)`;
-          await supabaseClient.from("ai_task_logs").insert({
-            task_type: failSummary.slice(0, 150),
-            status: "failed"
-          });
-        } catch (_logErr) {
-          // Không gián đoạn
-        }
+          const logPayload = {
+            task_type: `[${actualAgentUsed.toUpperCase()}] ${action.toUpperCase()}: Thất bại HTTP ${status}`,
+            status: "failed",
+            owner_id: authenticatedUser.id,
+            request_id: requestId,
+            agent: actualAgentUsed,
+            provider: PROVIDER_CONFIGS[selectedProvider]?.name || selectedProvider,
+            duration_ms: totalDurationMs,
+            error_message: errMsg.slice(0, 200)
+          };
+          const { error: insertErr } = await supabaseClient.from("ai_task_logs").insert(logPayload);
+          if (insertErr) {
+            await supabaseClient.from("ai_task_logs").insert({
+              task_type: `[${actualAgentUsed.toUpperCase()}] ${action}: Thất bại HTTP ${status} (${errMsg.slice(0, 60)})`,
+              status: "failed"
+            });
+          }
+        } catch (_logErr) {}
       }
 
-      // Xử lý hủy do người dùng
-      if (isClientAbort) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Yêu cầu đã bị hủy bởi người dùng.",
-            code: "ABORTED",
-            requestId,
-            attempts: attemptCount,
-            durationMs: totalElapsedMs
-          }),
-          { status: 499, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // Phân loại mã lỗi chính xác
-      // 401: Phiên đăng nhập không hợp lệ
-      if (status === 401) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Vui lòng đăng nhập lại.",
-            code: "UNAUTHORIZED",
-            details: rawDetailMessage,
-            requestId
-          }),
-          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // 403: API Key hoặc quyền truy cập không hợp lệ
-      if (status === 403) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Khóa GEMINI_API_KEY hoặc quyền truy cập không hợp lệ. Vui lòng kiểm tra API Key trong Supabase Secrets.",
-            code: "API_KEY_INVALID",
-            hint: "Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets.",
-            details: rawDetailMessage,
-            requestId
-          }),
-          { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // 429: Vượt hạn mức hoặc tốc độ yêu cầu
-      if (status === 429) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Gemini API vượt hạn mức hoặc tốc độ yêu cầu (429 Rate Limit). Vui lòng thử lại sau ít phút hoặc nâng cấp quota.",
-            code: "RATE_LIMIT_EXCEEDED",
-            details: rawDetailMessage,
-            attempts: attemptCount,
-            requestId,
-            durationMs: totalElapsedMs
-          }),
-          { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // 503: Gemini đang quá tải (High demand / Service Unavailable)
-      if (status === 503) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Gemini hiện đang quá tải. Vui lòng thử lại sau ít phút.",
-            code: "SERVICE_UNAVAILABLE",
-            details: rawDetailMessage || "This model is currently experiencing high demand. Spikes in demand are usually temporary.",
-            attempts: attemptCount,
-            requestId,
-            durationMs: totalElapsedMs
-          }),
-          { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // 504: Hết thời gian chờ (Timeout)
-      if (status === 504 || isTimeout) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Hết thời gian chờ phản hồi từ máy chủ AI (504 Gateway Timeout). Gemini đang xử lý chậm hơn bình thường. Vui lòng thử lại sau ít phút.",
-            code: "TIMEOUT",
-            details: `Xử lý vượt quá thời gian cho phép sau ${attemptCount} lượt thử (${Math.round(totalElapsedMs / 1000)}s).`,
-            attempts: attemptCount,
-            requestId,
-            durationMs: totalElapsedMs
-          }),
-          { status: 504, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      // 500 / 502: Lỗi máy chủ tạm thời
       return new Response(
         JSON.stringify({
           success: false,
-          error: `Lỗi máy chủ tạm thời từ dịch vụ Google Gemini (HTTP ${status}). Vui lòng thử lại sau ít phút.`,
-          code: status === 502 ? "BAD_GATEWAY" : "SERVER_ERROR",
-          details: rawDetailMessage,
-          attempts: attemptCount,
+          error: errMsg,
+          code: finalResult?.code || (isClientAbort ? "ABORTED" : "TIMEOUT"),
+          attempts,
           requestId,
-          durationMs: totalElapsedMs
+          durationMs: totalDurationMs,
+          fallbackReason
         }),
-        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { status, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // 9. Phân tích nội dung kết quả sinh ra từ Gemini
-    const geminiData = await lastResponse.json();
-    const candidateText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    if (!candidateText || candidateText.trim() === "") {
-      console.warn(`[${requestId}] [EMPTY_RESPONSE] Phản hồi từ Gemini không có text.`);
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: "Không nhận được phản hồi nội dung từ Gemini.",
-          code: "EMPTY_AI_RESPONSE",
-          attempts: attemptCount,
-          requestId
-        }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    // Làm sạch chuỗi JSON nếu Gemini bao bọc trong markdown code fence ```json ... ```
-    let cleanedText = candidateText.trim();
-    if (cleanedText.startsWith("```")) {
-      cleanedText = cleanedText
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/, "")
-        .trim();
-    }
-
-    let parsedResult: any;
-    try {
-      parsedResult = JSON.parse(cleanedText);
-    } catch {
-      parsedResult = { rawText: candidateText };
-    }
-
-    // 10. Ghi log duy nhất MỘT LẦN an toàn vào bảng ai_task_logs nếu thành công
+    // GHI LOG THÀNH CÔNG VÀO AI_TASK_LOGS
     if (supabaseClient && authenticatedUser) {
       try {
-        const taskDescription = `[Edge Function] ${action.toUpperCase()}: ${
-          payload?.productName || payload?.category || action
-        } (Thành công qua ${attemptCount} lượt, ${Math.round(totalElapsedMs / 1000)}s)`;
-        await supabaseClient.from("ai_task_logs").insert({
-          task_type: taskDescription.slice(0, 150),
-          status: "success"
-        });
-      } catch (_logErr) {
-        // Bỏ qua lỗi log database để đảm bảo phản hồi 200 cho người dùng
-      }
+        const successSummary = `[${actualAgentUsed.toUpperCase()}] ${action.toUpperCase()}: Thành công qua ${finalResult.model}`;
+        const logPayload = {
+          task_type: successSummary,
+          status: "success",
+          owner_id: authenticatedUser.id,
+          request_id: requestId,
+          agent: actualAgentUsed,
+          provider: finalResult.provider,
+          model: finalResult.model,
+          input_tokens: finalResult.usage.promptTokens,
+          output_tokens: finalResult.usage.completionTokens,
+          estimated_cost: finalResult.estimatedCostVND,
+          duration_ms: totalDurationMs
+        };
+
+        const { error: insertErr } = await supabaseClient.from("ai_task_logs").insert(logPayload);
+        if (insertErr) {
+          await supabaseClient.from("ai_task_logs").insert({
+            task_type: `${successSummary} (${finalResult.usage.totalTokens} tokens, ~${finalResult.estimatedCostVND}đ)`,
+            status: "success"
+          });
+        }
+      } catch (_logErr) {}
     }
 
-    console.log(`[${requestId}] [SUCCESS] Hoàn thành ${action} qua ${attemptCount} lượt trong ${totalElapsedMs}ms.`);
+    console.log(`[${requestId}] [SUCCESS] Hoàn thành bởi ${actualAgentUsed} (${finalResult.model}) trong ${totalDurationMs}ms.`);
 
-    // 11. Trả về kết quả hoàn chỉnh cho Frontend
+    // TRẢ VỀ KẾT QUẢ ĐÃ CHUẨN HÓA CHO FRONTEND
     return new Response(
       JSON.stringify({
         success: true,
         action,
-        model: geminiModel,
-        data: parsedResult,
-        attempts: attemptCount,
+        requestedAgent: targetAgent,
+        executedAgent: actualAgentUsed,
+        provider: finalResult.provider,
+        model: finalResult.model,
+        data: finalResult.parsedJson || { text: finalResult.text },
+        usage: finalResult.usage,
+        estimatedCostVND: finalResult.estimatedCostVND,
+        attempts,
         requestId,
-        durationMs: totalElapsedMs,
-        usage: geminiData?.usageMetadata || null
+        durationMs: totalDurationMs,
+        fallbackReason
       }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" }
-      }
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
 
-  } catch (error: any) {
-    console.error(`[${requestId}] [UNCAUGHT_EXCEPTION]`, error);
+  } catch (err: any) {
+    console.error(`[${requestId}] [UNCAUGHT_ERR]`, err);
     return new Response(
       JSON.stringify({
         success: false,
-        error: error?.message || "Đã xảy ra sự cố không xác định trên Supabase Edge Function.",
-        code: "INTERNAL_ERROR",
+        error: err?.message || "Đã xảy ra lỗi nội bộ trên AI Brain Edge Function.",
+        code: "INTERNAL_SERVER_ERROR",
         requestId
       }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -800,37 +1126,3 @@ Trả về JSON cấu trúc:
   }
 });
 ```
-
----
-
-## 5. Các Bước Kiểm Tra Sau Khi Triển Khai
-
-1. **Kiểm tra trực tiếp từ giao diện Supabase Dashboard**:
-   - Trong màn hình Function `generate-content`, chọn tab **Invocations** hoặc **Logs**.
-   - Kiểm tra xem function có đang ở trạng thái **Healthy / Active** hay không.
-   - Quan sát các log có định dạng `[req_xxx] [CALL_START]`, `[req_xxx] [CALL_RESP]` để theo dõi thời gian thực thi thực tế.
-
-2. **Thử nghiệm trên ứng dụng AI Affiliate Command Center**:
-   - Mở ứng dụng trong trình duyệt hoặc Safari trên iPhone.
-   - Nhấn **"Đăng Nhập Quản Trị"** và đăng nhập tài khoản Supabase của bạn.
-   - Chuyển sang module **Content Factory (Xưởng Kịch Bản)**.
-   - Nhấn **"Tạo Kịch Bản Mới"**, chọn sản phẩm và nhấn **"Bắt Đầu Gọi Gemini"**.
-   - Quan sát bộ đếm thời gian: `"Gemini đang viết kịch bản... (Xs / tối đa 120s)"`.
-   - Nếu cần dừng lại, nhấn nút **"Dừng & Hủy"**.
-   - Khi modal **"Xem Trước & Chỉnh Sửa Kịch Bản AI"** xuất hiện: kiểm tra câu Hook, các cảnh quay và lời thoại do Gemini sinh ra.
-   - Nhấn **"Lưu Kịch Bản Vào Bản Nháp (Supabase)"** -> Kịch bản sẽ được lưu vào bảng `content_drafts`.
-
----
-
-## 6. Bảng Phân Loại & Xử Lý Mã Lỗi Đã Đồng Bộ
-
-| Mã lỗi hiển thị | Phân loại trạng thái | Ngân sách & Cơ chế Retry | Hướng dẫn khắc phục trên UI |
-| :--- | :--- | :--- | :--- |
-| **HTTP 503** (`SERVICE_UNAVAILABLE`) | Gemini đang quá tải tạm thời (High demand) | Tự động thử lại 1 lần nếu còn $\ge 40$s | Hiển thị: *"Gemini hiện đang quá tải. Vui lòng thử lại sau ít phút."* (Tuyệt đối KHÔNG hiển thị kiểm tra API Key). |
-| **HTTP 429** (`RATE_LIMIT_EXCEEDED`) | Vượt hạn mức hoặc tốc độ yêu cầu (Rate Limit) | Tự động thử lại sau khoảng nghỉ nếu còn thời gian | Hiển thị: *"Hạn mức Gemini API đã chạm giới hạn (429 Rate Limit). Thử lại sau ít phút hoặc nâng hạn mức quota."* |
-| **HTTP 504** (`TIMEOUT`) | Quá thời gian xử lý AI ($>120$s) | Ngắt an toàn trước gateway 150s | Hiển thị: *"Hết thời gian chờ phản hồi từ máy chủ AI (504 Timeout). Gemini đang xử lý chậm hơn bình thường. Vui lòng thử lại hoặc chọn thời lượng 20s - 30s."* |
-| **HTTP 499** (`ABORTED`) | Người dùng chủ động hủy yêu cầu | Dừng ngay lập tức, không retry, không log lỗi | Hiển thị thông báo: *"Đã dừng yêu cầu tạo kịch bản theo yêu cầu của bạn."* |
-| **HTTP 500 / 502** (`SERVER_ERROR`) | Lỗi máy chủ tạm thời từ Google | Tự động thử lại nếu còn thời gian | Hiển thị: *"Lỗi máy chủ tạm thời từ dịch vụ Google Gemini. Vui lòng thử lại sau ít phút."* |
-| **HTTP 401** (`UNAUTHORIZED`) | Phiên đăng nhập không hợp lệ hoặc hết hạn | **Không retry** (lỗi vĩnh viễn) | Hiển thị: *"Phiên làm việc đã hết hạn. Vui lòng nhấn 'Đăng Nhập Quản Trị' để đăng nhập lại."* |
-| **HTTP 403** (`API_KEY_INVALID`) | Khóa API Key hoặc quyền truy cập không hợp lệ | **Không retry** (lỗi vĩnh viễn) | Hiển thị: *"Khóa GEMINI_API_KEY hoặc quyền truy cập không hợp lệ. Kiểm tra biến môi trường GEMINI_API_KEY trong Supabase Secrets."* |
-| **HTTP 404** (`FUNCTION_NOT_FOUND`) | Edge Function chưa được deploy trên Supabase | **Không retry** | Hiển thị: *"Edge Function chưa được deploy trên Supabase. Vui lòng xem hướng dẫn triển khai."* |

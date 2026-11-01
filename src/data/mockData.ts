@@ -39,111 +39,159 @@ export const platformDistribution: PlatformShare[] = [
 
 export const initialAgents: AIAgent[] = [
   {
-    id: 'scout',
-    name: 'Scout AI (Trinh Sát Deal)',
-    codeName: 'DEAL-HUNTER-V3',
-    role: 'Săn Deal Hot & Phân Tích Trend Thị Trường',
-    description: 'Tự động quét thuật toán TikTok Shop & Shopee Việt Nam mỗi 2 giờ để tìm sản phẩm hoa hồng cao (>15%) và điểm lan tỏa > 80.',
-    model: 'DeepSeek V3',
+    id: 'chatgpt',
+    name: 'ChatGPT (Chiến Lược & Điều Hành)',
+    codeName: 'AGENT-1-STRATEGY',
+    role: 'Operations & Strategy (Điều Hành & Chiến Lược)',
+    tasks: [
+      'Phân tích yêu cầu và bài toán affiliate',
+      'Lập kế hoạch phân bổ tài nguyên chiến dịch',
+      'Tổng hợp kết quả từ các Agent chuyên biệt',
+      'Đưa ra báo cáo tổng kết và đề xuất hành động tối ưu'
+    ],
+    description: 'Bộ não tổng chỉ huy: tiếp nhận yêu cầu, phân bổ công việc cho các Agent, tổng hợp báo cáo và hoạch định lộ trình tăng trưởng doanh thu.',
+    provider: 'OpenAI',
+    providerId: 'openai',
+    model: 'gpt-4o-mini',
+    connectionStatus: 'NOT_CONFIGURED',
     status: 'active',
-    tokenUsedToday: 42150,
-    tokenLimit: 100000,
-    tasksCompleted: 48,
-    systemPrompt: `Bạn là Scout AI - Chuyên gia phân tích dữ liệu E-commerce và Affiliate Marketing hàng đầu Việt Nam.
-Nhiệm vụ của bạn:
-1. Phát hiện các sản phẩm có tốc độ tăng trưởng doanh số đột biến (>30%/ngày) trên TikTok Shop VN và Shopee VN.
-2. Sàng lọc sản phẩm có tỷ lệ hoa hồng tối thiểu từ 15% trở lên, uy tín shop tối thiểu 4.7 sao.
-3. Chấm điểm Tiềm năng Lan tỏa (Viral Score từ 0-100) dựa trên volume thảo luận mạng xã hội.
-4. Xuất danh sách dạng JSON chuẩn để Copywriter AI kế thừa.`,
-    lastActive: '3 phút trước',
-    avatarIcon: 'Radar',
-    colorAccent: '#00F0FF',
-    logSummary: 'Vừa quét 420 deal mới trên TikTok Shop, phát hiện 6 sản phẩm đạt tiêu chuẩn Viral.'
+    tokenUsedToday: 0,
+    tokenLimit: 120000,
+    tasksCompleted: 0,
+    estimatedCostVND: 0,
+    systemPrompt: `Bạn là AGENT 1 - ChatGPT (Operations & Strategy Lead) thuộc hệ thống AI Affiliate Command Center Việt Nam.
+Nhiệm vụ:
+1. Phân tích yêu cầu và bài toán affiliate tổng thể của người dùng.
+2. Lập kế hoạch phân bổ công việc cho các Agent vệ tinh (Gemini, Grok, Claude, DeepSeek).
+3. Tổng hợp kết quả đầu ra thành báo cáo chiến lược rõ ràng, ngắn gọn và có tính hành động cao.`,
+    lastActive: 'Chờ kết nối API Key',
+    avatarIcon: 'Bot',
+    colorAccent: '#10B981',
+    logSummary: 'Chờ cấu hình OPENAI_API_KEY trong Supabase Secrets.'
   },
   {
-    id: 'copywriter',
-    name: 'Copywriter AI (Biên Kịch Triệu View)',
-    codeName: 'VIRAL-HOOK-GEN',
-    role: 'Sản Xuất Kịch Bản Video Ngắn & Hook Giật Tít',
-    description: 'Chuyên tạo kịch bản 30-45 giây chuẩn tâm lý mua hàng người Việt, tối ưu hook 3 giây đầu giữ chân người xem và kích thích bấm giỏ hàng.',
-    model: 'Gemini 2.5 Flash',
+    id: 'gemini',
+    name: 'Gemini (Nghiên Cứu Deal & Nội Dung)',
+    codeName: 'AGENT-2-CONTENT-INTEL',
+    role: 'Market Research & Content Intelligence (Deal & Kịch Bản)',
+    tasks: [
+      'Phân tích tiềm năng sản phẩm affiliate',
+      'Nghiên cứu thông tin và trích xuất USP sản phẩm',
+      'Sản xuất kịch bản video TikTok/Shopee chuyển đổi cao',
+      'Phân tích dữ liệu đầu vào và tối ưu Hook 3s'
+    ],
+    description: 'Chuyên gia cốt lõi (Provider chính): phân tích sâu thông số deal, trích xuất điểm bán hàng độc nhất và tự động sáng tạo kịch bản video ngắn đa biến thể.',
+    provider: 'Google Gemini',
+    providerId: 'gemini',
+    model: 'gemini-2.5-flash',
+    connectionStatus: 'CONNECTED',
     status: 'active',
-    tokenUsedToday: 68400,
-    tokenLimit: 150000,
-    tasksCompleted: 64,
-    systemPrompt: `Bạn là Copywriter AI - Bậc thầy sáng tạo kịch bản TikTok Shorts và Reels bán hàng tại thị trường Việt Nam.
-Nguyên tắc vàng:
-1. Hook 3 giây đầu phải chạm đúng 'nỗi đau' hoặc 'đập vỡ định kiến' (VD: Đừng mua nếu chưa biết điều này...).
-2. Thân bài giải thích ngắn gọn, từ ngữ đời thường, giàu cảm xúc, dẫn chứng cụ thể.
-3. Kêu gọi hành động (CTA) dứt khoát: "Nhấp ngay vào giỏ hàng màu vàng góc trái màn hình để săn voucher giảm 50k".
-4. Luôn tạo sẵn 2 phương án Hook A và Hook B để thử nghiệm A/B Testing.`,
+    tokenUsedToday: 52400,
+    tokenLimit: 200000,
+    tasksCompleted: 42,
+    estimatedCostVND: 14200,
+    systemPrompt: `Bạn là AGENT 2 - Gemini (Market Research & Content Intelligence) thuộc AI Affiliate Command Center Việt Nam.
+Nhiệm vụ:
+1. Nghiên cứu sâu thông số sản phẩm, hoa hồng, giá bán và đặc điểm USP.
+2. Sáng tạo kịch bản video ngắn TikTok Shop/Shopee Affiliate chuẩn tâm lý mua hàng người Việt.
+3. Luôn tạo 2 biến thể Hook A/B giật tít, phân cảnh thời gian chi tiết và lời kêu gọi hành động dứt khoát.`,
     lastActive: 'Vừa xong',
     avatarIcon: 'Sparkles',
-    colorAccent: '#A855F7',
-    logSummary: 'Đã hoàn thành 3 kịch bản video review cho sản phẩm Tai Nghe Baseus Bowie M2s.'
+    colorAccent: '#00F0FF',
+    logSummary: 'Đã sẵn sàng qua Edge Function với model gemini-2.5-flash.'
   },
   {
-    id: 'visual',
-    name: 'Visual AI (Đạo Diễn Hình Ảnh)',
-    codeName: 'STORYBOARD-DIRECTOR',
-    role: 'Lên Kịch Bản Phân Cảnh & Prompt Video/Ảnh',
-    description: 'Tạo hướng dẫn góc quay bằng camera điện thoại, phân cảnh từng giây, gợi ý phụ đề text-on-screen và hiệu ứng chuyển cảnh bắt mắt.',
-    model: 'Claude 3.5 Sonnet',
+    id: 'grok',
+    name: 'Grok (Đón Đầu Xu Hướng & Trend)',
+    codeName: 'AGENT-3-TREND-RADAR',
+    role: 'Trend Intelligence (Trí Tuệ Xu Hướng)',
+    tasks: [
+      'Phân tích xu hướng thảo luận mạng xã hội',
+      'Đánh giá ý tưởng nội dung theo độ lan tỏa',
+      'Đề xuất chủ đề video đón đầu làn sóng thị trường',
+      'Phân tích tín hiệu âm thanh và hashtag thịnh hành'
+    ],
+    description: 'Trinh sát xu hướng: quét tín hiệu mạng xã hội theo thời gian thực để bắt trọn âm thanh thịnh hành, góc nhìn giật tít và chủ đề nóng sốt.',
+    provider: 'xAI Grok',
+    providerId: 'grok',
+    model: 'grok-beta',
+    connectionStatus: 'NOT_CONFIGURED',
     status: 'active',
-    tokenUsedToday: 31200,
-    tokenLimit: 80000,
-    tasksCompleted: 29,
-    systemPrompt: `Bạn là Visual AI - Đạo diễn hình ảnh video ngắn chuyên biệt cho nhà sáng tạo nội dung Affiliate trên smartphone.
+    tokenUsedToday: 0,
+    tokenLimit: 100000,
+    tasksCompleted: 0,
+    estimatedCostVND: 0,
+    systemPrompt: `Bạn là AGENT 3 - Grok (Trend Intelligence Specialist) thuộc AI Affiliate Command Center.
 Nhiệm vụ:
-1. Chia phân cảnh theo từng mốc thời gian: 0-3s, 4-10s, 11-25s, 26-35s.
-2. Hướng dẫn góc quay thực tế bằng iPhone (cận cảnh macro, góc nhìn thứ nhất POV, unbox góc 45 độ).
-3. Đề xuất text hiệu ứng phụ đề lớn, font chữ không chân, màu vàng/trắng tương phản cao.`,
-    lastActive: '12 phút trước',
-    avatarIcon: 'Video',
-    colorAccent: '#38BDF8',
-    logSummary: 'Tạo xong storyboard 4 phân cảnh quay sản phẩm Nồi chiên không dầu Lock&Lock.'
-  },
-  {
-    id: 'ads',
-    name: 'Ads & Traffic AI (Tối Ưu Ngân Sách)',
-    codeName: 'ROI-OPTIMIZER',
-    role: 'Tự Động Phân Bổ Ngân Sách & Tính ROI',
-    description: 'Theo dõi chi phí quảng cáo (TikTok Spark Ads / Shopee Ads), tính toán chính xác ROI theo thời gian thực và tự ngắt nếu ROI < 150%.',
-    model: 'Gemini 2.5 Flash',
-    status: 'idle',
-    tokenUsedToday: 18900,
-    tokenLimit: 80000,
-    tasksCompleted: 18,
-    systemPrompt: `Bạn là Ads & Traffic AI - Quản lý ngân sách và tối ưu hóa chiến dịch quảng cáo Affiliate.
-Mục tiêu:
-1. Bảo vệ lợi nhuận ròng: Nếu chiến dịch có ROI dưới 150% trong 6 giờ liên tiếp, phát tín hiệu tạm dừng.
-2. Đề xuất tăng ngân sách 20% cho các video có tỷ lệ chuyển đổi đơn hàng trên 4.5%.
-3. Tối ưu chi phí mỗi lượt nhấp (CPC) dưới 600 VNĐ.`,
-    lastActive: '25 phút trước',
-    avatarIcon: 'TrendingUp',
-    colorAccent: '#10B981',
-    logSummary: 'Đang giám sát 4 chiến dịch quảng cáo; chi phí CPC trung bình ổn định ở mức 480 VNĐ.'
-  },
-  {
-    id: 'auditor',
-    name: 'Auditor AI (Kiểm Soát Rủi Ro & Tuân Thủ)',
-    codeName: 'POLICY-SENTINEL',
-    role: 'Rà Soát Từ Khóa Cấm & An Toàn Tài Khoản',
-    description: 'Kiểm duyệt kịch bản để tránh các từ bị TikTok Shop / Shopee cấm (cam kết 100%, trị dứt điểm, số 1...) tránh bị bóp tương tác hoặc vi phạm.',
-    model: 'Claude 3.5 Sonnet',
-    status: 'active',
-    tokenUsedToday: 24700,
-    tokenLimit: 90000,
-    tasksCompleted: 42,
-    systemPrompt: `Bạn là Auditor AI - Chuyên viên tuân thủ chính sách nền tảng TikTok Shop Việt Nam, Shopee và Meta.
-Nhiệm vụ:
-1. Quét toàn bộ kịch bản, hashtag và mô tả để phát hiện từ cấm: "100%", "cam kết", "trị mụn dứt điểm", "thần thánh", "hàng auth xách tay không giấy tờ".
-2. Đề xuất phương án thay thế an toàn nhưng vẫn giữ được sức thuyết phục cao.
-3. Rà soát link affiliate xem có chuyển hướng lỗi (404) hoặc hết mã giảm giá.`,
-    lastActive: '6 phút trước',
-    avatarIcon: 'ShieldCheck',
+1. Bắt trọn xu hướng thảo luận nóng nhất trên mạng xã hội Việt Nam.
+2. Đánh giá tính mới lạ, độc đáo và khả năng lan tỏa (virality) của các ý tưởng video.
+3. Đề xuất góc nhìn ngược số đông hoặc hài hước châm biếm phù hợp thị hiếu giới trẻ.`,
+    lastActive: 'Chờ kết nối API Key',
+    avatarIcon: 'Radar',
     colorAccent: '#F59E0B',
-    logSummary: 'Đã phê duyệt 18 kịch bản; yêu cầu chỉnh sửa 1 kịch bản có từ khóa cam kết tuyệt đối.'
+    logSummary: 'Chờ cấu hình GROK_API_KEY trong Supabase Secrets.'
+  },
+  {
+    id: 'claude',
+    name: 'Claude (Chất Lượng & Tuân Thủ)',
+    codeName: 'AGENT-4-COMPLIANCE',
+    role: 'Content Quality & Compliance (Kiểm Định & Tuân Thủ)',
+    tasks: [
+      'Đánh giá chất lượng và logic kịch bản',
+      'Rà soát tuyên bố thiếu căn cứ và từ ngữ cấm',
+      'Đánh giá độ tự nhiên và khả năng giữ chân người xem',
+      'Đề xuất giải pháp sửa câu từ an toàn tài khoản'
+    ],
+    description: 'Thẩm định viên nội dung: rà soát từ ngữ nhạy cảm theo chính sách TikTok Shop/Shopee, đảm bảo văn phong tự nhiên, bảo vệ an toàn kênh.',
+    provider: 'Anthropic Claude',
+    providerId: 'claude',
+    model: 'claude-3-5-sonnet',
+    connectionStatus: 'NOT_CONFIGURED',
+    status: 'active',
+    tokenUsedToday: 0,
+    tokenLimit: 90000,
+    tasksCompleted: 0,
+    estimatedCostVND: 0,
+    systemPrompt: `Bạn là AGENT 4 - Claude (Content Quality & Compliance Sentinel) thuộc AI Affiliate Command Center.
+Nhiệm vụ:
+1. Rà soát nghiêm ngặt các từ ngữ bị cấm hoặc hạn chế trên TikTok Shop và Shopee Việt Nam (cam kết 100%, dứt điểm, số 1...).
+2. Đánh giá tính mạch lạc, cảm xúc chân thực và sự tinh tế trong lời thoại.
+3. Đưa ra phương án thay thế thông minh giúp giữ vững thông điệp mà tuyệt đối an toàn chính sách.`,
+    lastActive: 'Chờ kết nối API Key',
+    avatarIcon: 'ShieldCheck',
+    colorAccent: '#A855F7',
+    logSummary: 'Chờ cấu hình ANTHROPIC_API_KEY trong Supabase Secrets.'
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek (Kỹ Thuật & Phân Tích Dữ Liệu)',
+    codeName: 'AGENT-5-DATA-TECH',
+    role: 'Technical & Data Analysis (Phân Tích Dữ Liệu & Kỹ Thuật)',
+    tasks: [
+      'Phân tích dữ liệu hiệu suất và chuyển đổi',
+      'Hỗ trợ tính toán ngưỡng sinh lời ROI/ROAS',
+      'Phân tích chi phí quảng cáo và hiệu quả phân phối',
+      'Xử lý logic kỹ thuật và mô hình hóa dữ liệu'
+    ],
+    description: 'Chuyên gia tính toán (Provider dự phòng): bóc tách dữ liệu chuyển đổi, tính toán ngưỡng sinh lời ROI, tối ưu hóa ngân sách và xử lý logic phức tạp.',
+    provider: 'DeepSeek',
+    providerId: 'deepseek',
+    model: 'deepseek-chat',
+    connectionStatus: 'NOT_CONFIGURED',
+    status: 'active',
+    tokenUsedToday: 0,
+    tokenLimit: 150000,
+    tasksCompleted: 0,
+    estimatedCostVND: 0,
+    systemPrompt: `Bạn là AGENT 5 - DeepSeek (Technical & Data Analysis Engine) thuộc AI Affiliate Command Center.
+Nhiệm vụ:
+1. Phân tích định lượng số liệu traffic, click, đơn hàng và doanh số affiliate.
+2. Tính toán chính xác ngưỡng hòa vốn, ROI kỳ vọng dựa trên tỷ lệ hoa hồng thực tế.
+3. Đóng vai trò Provider tính toán dự phòng tin cậy cho toàn bộ hệ thống.`,
+    lastActive: 'Chờ kết nối API Key',
+    avatarIcon: 'TrendingUp',
+    colorAccent: '#38BDF8',
+    logSummary: 'Chờ cấu hình DEEPSEEK_API_KEY trong Supabase Secrets.'
   }
 ];
 
